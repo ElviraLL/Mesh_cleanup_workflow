@@ -1,0 +1,65 @@
+# Default tunables for humanoid AI-generated mesh cleanup.
+# Mirrors mesh_pipeline/config/schema.py::DEFAULT_CONFIG -- keep both in sync.
+# Any subset of these keys may be overridden in a job-specific config; unknown
+# keys are rejected by load_config().
+
+input:
+  up_axis: auto          # detect + normalize
+
+weld:
+  sweep: [1e-4, 5e-3]    # probe on throwaway bmesh copies
+  auto_pick:
+    strategy: max_merge_rate
+    max_merge_rate: 0.03 # first threshold before merge-rate exceeds 3% of verts
+
+hidden_geometry:
+  part_rays: 26           # part-level visibility directions
+  face_rays: 48            # fibonacci-sphere per-face pass
+  dilate_rings: 2          # protect concave areas (nostrils/ears)
+
+hole_fill:
+  max_loop_edges: 20
+  # NEVER auto-fill loops inside these zones (prevents capping eye sockets)
+  protected_zones:
+    - type: eye_regions
+      radius_factor: 1.5   # sphere around each eyeball center, r = 1.5x eyeball radius
+    - type: lip_region      # box around detected lip line
+
+mouth:
+  enabled: true                          # feature flag -- pipeline must run fine with this off
+  cutter_radii: [0.020, 0.042, 0.0085]   # per 1-unit body height, scale accordingly
+  teeth_recess_mm: [1, 2]                # assertion range behind lip rim
+
+eyes:
+  enabled: true           # feature flag
+  opening_ratio: 0.72     # of original eye height, centered on pupil line
+  fissure_offset_mm: -2   # carve 2mm BELOW eyeball equator
+  replace_dirty_eyeballs: true   # clean UV spheres + procedural iris
+  build_socket: false            # socket interior is high-risk; default OFF
+
+uv:
+  min_region: 40            # dominant-axis segmentation absorption threshold
+  keep_clean_islands: true  # don't re-unwrap eyes/teeth if already clean
+
+bake:
+  resolution: 2048
+  channels: [diffuse]     # detect from material node trees; add roughness/normal if used
+  samples: 32              # headless has no timeout; can afford more than MCP's 4-8
+  max_ray_distance: 0.025
+  margin_px: 16
+
+export:
+  format: glb
+  names:
+    body: Body
+    eye_l: Eye_L
+    eye_r: Eye_R
+    teeth_u: Teeth_Upper
+    teeth_l: Teeth_Lower
+    tongue: Tongue
+  hierarchy: parent_under_body   # parented, NOT joined
+
+qa:
+  render_views: [front, back, left, right, top, three_quarter]
+  xray_view: true
+  resolution: 640
