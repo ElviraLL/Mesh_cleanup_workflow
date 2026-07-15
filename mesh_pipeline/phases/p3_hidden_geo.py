@@ -77,6 +77,14 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
     bvh_a, tri_owner_a = _build_bvh(tri_sources)
     far_a = _far_distance(tri_sources)
 
+    # Scene-wide face totals, captured before any deletion. deleted_face_ratio
+    # (assertion band 0.30-0.80, docs: "expect 50-70% of an AI mesh to be
+    # hidden junk") is a holistic measure spanning BOTH passes -- whole junk
+    # parts deleted in A plus the fused-inner-layer faces deleted in B --
+    # not just the body's own per-face pass, otherwise a mesh whose junk is
+    # entirely separate loose parts (no fused inner shell) would score 0.
+    total_faces_before = sum(len(o.data.polygons) for o in mesh_objs)
+
     keep_names = {ctx.names[role] for role in _NEVER_DELETE_ROLES if role in ctx.names}
     role_by_name: dict[str, str] = {}
     for role, name in ctx.names.items():
@@ -97,10 +105,12 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
                 to_delete_names.append(o.name)
 
     parts_deleted: list[str] = []
+    parts_faces_deleted = 0
     for name in to_delete_names:
         parts_deleted.append(role_by_name.get(name, name))
         obj = bpy.data.objects.get(name)
         if obj is not None:
+            parts_faces_deleted += len(obj.data.polygons)
             bpy.data.objects.remove(obj, do_unlink=True)
 
     # Deleted objects must not linger in the name registry for later phases.
@@ -119,7 +129,7 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
     bm.faces.ensure_lookup_table()
     bm.verts.ensure_lookup_table()
 
-    faces_before = len(bm.faces)
+    body_faces_before = len(bm.faces)
 
     surviving_objs = [
         o for o in bpy.data.objects if o.type == "MESH" and o.name not in backup_names
@@ -180,17 +190,24 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
     if small_verts:
         bmesh.ops.delete(bm, geom=small_verts, context="VERTS")
 
-    faces_after = len(bm.faces)
+    body_faces_after = len(bm.faces)
     bm.to_mesh(me)
     me.update()
     bm.free()
 
-    faces_deleted = faces_before - faces_after
-    deleted_face_ratio = (faces_deleted / faces_before) if faces_before else 0.0
+    body_faces_deleted = body_faces_before - body_faces_after
+    faces_deleted = parts_faces_deleted + body_faces_deleted
+    deleted_face_ratio = (faces_deleted / total_faces_before) if total_faces_before else 0.0
+
+    notes.append(
+        f"pass A: deleted {len(parts_deleted)} whole part(s), {parts_faces_deleted} faces; "
+        f"pass B (body): {body_faces_before} -> {body_faces_after} faces "
+        f"({body_faces_deleted} deleted)"
+    )
 
     metrics = {
         "parts_deleted": parts_deleted,
-        "faces_before": faces_before,
+        "faces_before": total_faces_before,
         "faces_deleted": faces_deleted,
         "deleted_face_ratio": deleted_face_ratio,
     }
