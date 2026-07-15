@@ -128,6 +128,25 @@ def _restore_scene_settings(scene, saved: dict) -> None:
     shading.xray_alpha = saved["shading_xray_alpha"]
 
 
+def _require_gl() -> None:
+    """Fail with a catchable error when no EGL/GL library is present.
+
+    Workbench (and Eevee) rendering without GL does not raise -- it SIGABRTs
+    the whole Blender process, which the pipeline runner cannot catch. A
+    missing-library preflight turns that into an ordinary exception that
+    cli.attempt_qa_renders records as a note instead of killing the job.
+    (On headless boxes: `apt install libegl1 libegl-mesa0 libgl1-mesa-dri`
+    provides software GL via Mesa.)
+    """
+    import ctypes.util
+
+    if ctypes.util.find_library("EGL") is None and ctypes.util.find_library("GL") is None:
+        raise RuntimeError(
+            "No EGL/GL library found; skipping QA renders (Workbench would "
+            "abort the process). Install Mesa: libegl1 libegl-mesa0 libgl1-mesa-dri."
+        )
+
+
 def render(ctx, cfg, tag: str) -> list[Path]:
     """Render QA views of every currently-visible deliverable mesh.
 
@@ -146,6 +165,8 @@ def render(ctx, cfg, tag: str) -> list[Path]:
     just at the end of the pipeline).
     """
     import bpy
+
+    _require_gl()
 
     scene = bpy.context.scene
     saved = _save_scene_settings(scene)

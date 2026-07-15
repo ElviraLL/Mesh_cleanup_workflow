@@ -33,17 +33,17 @@ task spec:
    unwrap from bleeding into material slots that were left alone).
 5. Edit mode on the body alone: select the dirty faces via bmesh (never
    view-based selection) and run `bpy.ops.uv.unwrap(method='ANGLE_BASED')`.
-6. Multi-object edit mode across every deliverable mesh object (body +
-   whichever of eye_l/eye_r/teeth*/tongue exist in ctx.names -- eyes/teeth
-   are separate objects, parented not joined, so this is the only way to
-   pack their islands into the *same* shared atlas space) with all faces
-   selected, then `bpy.ops.uv.pack_islands`. All deliverable objects' UV
-   layers are renamed to "UVMap" first since multi-object UV ops require
-   matching layer names.
+6. `bpy.ops.uv.pack_islands` on the BODY ONLY. The deliverable hierarchy is
+   parented, NOT joined (PLAN.md non-goal), and each non-body deliverable
+   keeps its own material/texture -- e.g. p6's procedural iris writes its own
+   equirect UVs. Packing across objects would move every island (the docs'
+   own warning) and silently break those textures while buying nothing, since
+   p8 bakes the atlas for the body alone. The body's UV layer is normalized
+   to "UVMap" first.
 7. Recount islands after, and compute `island_overlap_count` via pairwise
-   UV-space bounding-box overlap across every island of every deliverable
-   object (documented approximation -- true polygon overlap would need
-   rasterization; bbox overlap is the accepted v1 test per the task spec).
+   UV-space bounding-box overlap across the body's islands (documented
+   approximation -- true polygon overlap would need rasterization; bbox
+   overlap is the accepted v1 test per the task spec).
 """
 
 from __future__ import annotations
@@ -59,19 +59,6 @@ DESTRUCTIVE = True
 
 UV_LAYER_NAME = "UVMap"
 
-# Role keys that count as "deliverable" mesh objects sharing the atlas space.
-# Matches export.names in config/schema.py, plus "teeth" -- p2_weld_split's
-# classifier currently only produces a single "teeth" role (p5/p6, which
-# would split it into teeth_u/teeth_l/tongue, are not implemented yet).
-_DELIVERABLE_ROLE_KEYS = [
-    "body",
-    "eye_l",
-    "eye_r",
-    "teeth_u",
-    "teeth_l",
-    "teeth",
-    "tongue",
-]
 
 # A material-slot's own faces are considered "dirty" (confetti / no clean
 # unwrap) once its island count reaches this fraction of its own face count.
@@ -114,13 +101,20 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
     else:
         notes.append("no dirty faces; skipped uv.unwrap (all material slots already clean)")
 
-    # -- (6) shared pack across every deliverable object ---------------------
-    deliverable_names = _deliverable_object_names(ctx)
+    # -- (6) pack the BODY's islands only -------------------------------------
+    # Design decision (see PLAN.md non-goals): the deliverable hierarchy is
+    # parented, NOT joined, and each non-body deliverable keeps its own
+    # material/texture (e.g. p6's procedural iris writes its own equirect
+    # UVs). Packing across objects would move every island (docs: "packing
+    # moves/scales *every* island") and silently break those textures, while
+    # buying nothing -- only the body is baked into the atlas in p8. So the
+    # shared 0-1 space is scoped to the body object alone.
+    deliverable_names = [body_name]
     _ensure_uv_layer_named(deliverable_names, UV_LAYER_NAME)
     _pack_islands_multi_object(deliverable_names, body_name)
     notes.append(
-        f"packed islands for deliverable objects: {sorted(deliverable_names)} "
-        f"(active={body_name!r})"
+        f"packed islands for body only (active={body_name!r}); non-body "
+        "deliverables keep their own UVs/textures (parented-not-joined design)"
     )
 
     # -- (7) islands after + overlap check -----------------------------------
@@ -303,27 +297,9 @@ def _unwrap_dirty_faces(body_name: str, dirty_indices: list[int]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# (6): shared multi-object pack
+# (6): pack (body only -- see run() step 6 for the design rationale)
 # ---------------------------------------------------------------------------
 
-
-def _deliverable_object_names(ctx: PipelineContext) -> list[str]:
-    """Every ctx.names role that represents a deliverable mesh object.
-
-    Body is always included when registered; eyes/teeth/tongue are added
-    only if that role exists yet (p5/p6 are feature-flagged and may not have
-    run, or may not exist at all in the current pipeline build).
-    """
-    names: list[str] = []
-    seen: set[str] = set()
-    for role in _DELIVERABLE_ROLE_KEYS:
-        name = ctx.names.get(role)
-        if name and name in bpy.data.objects and name not in seen:
-            obj = bpy.data.objects[name]
-            if obj.type == "MESH":
-                names.append(name)
-                seen.add(name)
-    return names
 
 
 def _ensure_uv_layer_named(object_names: list[str], layer_name: str) -> None:
