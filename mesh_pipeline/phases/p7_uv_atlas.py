@@ -48,11 +48,8 @@ task spec:
 
 from __future__ import annotations
 
-from collections import Counter
-
 import bmesh
 import bpy
-from mathutils import Vector
 
 from mesh_pipeline import geom
 from mesh_pipeline.context import PhaseResult, PipelineContext
