@@ -254,6 +254,11 @@ def _boolean_difference(target_obj, cutter_obj_name: str) -> None:
     mod.object = cutter
     mod.operation = "DIFFERENCE"
     mod.solver = "EXACT"
+    # TRANSFER (not the INDEX default) is required so cutter faces actually
+    # carry the cutter's material into a new slot on the target -- this is
+    # how the Mouth_Interior material reaches the cavity walls; INDEX would
+    # silently keep every new face on the target's existing material index.
+    mod.material_mode = "TRANSFER"
     bpy.context.view_layer.objects.active = target_obj
     bpy.ops.object.modifier_apply(modifier=mod.name)
     cutter_mesh = cutter.data

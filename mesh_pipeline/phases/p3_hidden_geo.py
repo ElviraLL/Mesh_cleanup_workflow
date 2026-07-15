@@ -34,7 +34,7 @@ import math
 
 import bmesh
 import bpy
-from mathutils import Vector
+from mathutils import Quaternion, Vector
 from mathutils.bvhtree import BVHTree
 
 from mesh_pipeline import geom
@@ -48,6 +48,26 @@ _FACE_CHUNK = 20_000
 _MIN_ISLAND_VERTS = 40
 _BACKUP_COLLECTION = "_backup_pre_cleanup"
 _NEVER_DELETE_ROLES = ("eye_l", "eye_r")
+
+# geom.fibonacci_sphere's first direction is always exactly (0, 1, 0) (and in
+# general its points sit on tidy lat/long-ish rings). Humanoid meshes are
+# almost always bilaterally symmetric about x=0, so an axis-aligned ray
+# through an x~0 vertex can travel exactly along a mesh seam/meridian plane
+# -- BVHTree.ray_cast is numerically unstable on such exactly-grazing rays
+# and can miss the true nearest hit (observed directly: a ray correctly
+# hitting an outer shell when tested alone would instead report a farther
+# object's surface as "closer" once other geometry shared the same BVH).
+# Rotating the whole sampling direction set by a small fixed angle around a
+# generic (non-axis-aligned) skew axis breaks that exact alignment for
+# every symmetric mesh without materially changing what the discrete
+# direction set samples.
+_JITTER_AXIS = Vector((0.4172, 0.5911, 0.6883)).normalized()
+_JITTER_ANGLE = math.radians(1.0)
+_JITTER_QUAT = Quaternion(_JITTER_AXIS, _JITTER_ANGLE)
+
+
+def _deskewed(directions: list[Vector]) -> list[Vector]:
+    return [_JITTER_QUAT @ d for d in directions]
 
 
 def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
@@ -90,7 +110,7 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
     for role, name in ctx.names.items():
         role_by_name.setdefault(name, role)
 
-    directions_a = [Vector(d) for d in geom.fibonacci_sphere(part_rays)]
+    directions_a = _deskewed([Vector(d) for d in geom.fibonacci_sphere(part_rays)])
 
     to_delete_names: list[str] = []
     if bvh_a is not None:
@@ -150,7 +170,7 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
 
     bvh_b, _ = _build_bvh(tri_sources_b)
     far_b = _far_distance(tri_sources_b)
-    directions_b = [Vector(d) for d in geom.fibonacci_sphere(face_rays)]
+    directions_b = _deskewed([Vector(d) for d in geom.fibonacci_sphere(face_rays)])
 
     vis_layer = bm.faces.layers.int.new("vis_flag")
     all_faces = bm.faces[:]
