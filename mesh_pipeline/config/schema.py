@@ -67,6 +67,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "uv": {
         "min_region": 40,  # dominant-axis segmentation absorption threshold
         "keep_clean_islands": True,  # don't re-unwrap eyes/teeth if already clean
+        "max_islands": 40,  # P7 assertion target: uv_islands_after must be <= this
     },
     "bake": {
         "resolution": 2048,
@@ -229,6 +230,7 @@ def _validate(cfg: dict[str, Any]) -> list[str]:
     uv = cfg["uv"]
     check(isinstance(uv["min_region"], int) and uv["min_region"] > 0, "uv.min_region must be a positive int")
     check(isinstance(uv["keep_clean_islands"], bool), "uv.keep_clean_islands must be a bool")
+    check(isinstance(uv["max_islands"], int) and uv["max_islands"] > 0, "uv.max_islands must be a positive int")
 
     bake = cfg["bake"]
     check(_is_power_of_two(bake["resolution"]), "bake.resolution must be a positive power of two")
