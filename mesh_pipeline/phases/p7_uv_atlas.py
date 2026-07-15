@@ -108,12 +108,12 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
     notes.append(f"uv_islands_before (body, {body_name!r}) = {uv_islands_before}")
 
     # -- (2)+(3)+(4): decide dirty faces, segment, absorb, mark seams --------
-    dirty_count, region_count = _resegment_body(body, min_region, keep_clean, notes)
+    dirty_indices, region_count = _resegment_body(body, min_region, keep_clean, notes)
 
     # -- (5) unwrap the dirty faces on the body alone ------------------------
-    if dirty_count > 0:
-        _unwrap_dirty_faces(body_name)
-        notes.append(f"unwrapped {dirty_count} dirty face(s) into {region_count} region(s)")
+    if dirty_indices:
+        _unwrap_dirty_faces(body_name, dirty_indices)
+        notes.append(f"unwrapped {len(dirty_indices)} dirty face(s) into {region_count} region(s)")
     else:
         notes.append("no dirty faces; skipped uv.unwrap (all material slots already clean)")
 
@@ -162,8 +162,17 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
 # ---------------------------------------------------------------------------
 
 
-def _resegment_body(body, min_region: int, keep_clean: bool, notes: list[str]) -> tuple[int, int]:
-    """Mutates body.data: clears seams, marks new ones. Returns (dirty_face_count, region_count)."""
+def _resegment_body(
+    body, min_region: int, keep_clean: bool, notes: list[str]
+) -> tuple[list[int], int]:
+    """Mutates body.data: clears seams, marks new ones.
+
+    Returns (dirty_face_indices, region_count). No verts/faces are added or
+    removed in this pass (only the seam flag changes), so the returned face
+    indices stay valid against body.data.polygons after this call --
+    _unwrap_dirty_faces re-derives its own bmesh from edit-mesh and indexes
+    into it with these same integers.
+    """
     me = body.data
     bm = bmesh.new()
     bm.from_mesh(me)
@@ -205,7 +214,7 @@ def _resegment_body(body, min_region: int, keep_clean: bool, notes: list[str]) -
     bm.to_mesh(me)
     me.update()
     bm.free()
-    return len(dirty_indices), region_count
+    return dirty_indices, region_count
 
 
 def _dirty_face_indices(bm, uvl, keep_clean: bool, notes: list[str]) -> list[int]:
@@ -274,23 +283,13 @@ def _dominant_axis_label(normal) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _unwrap_dirty_faces(body_name: str) -> None:
-    """Selects dirty faces via seams: any face touching a seam edge that was
-    marked in `_resegment_body` needs re-unwrapping (the seams themselves
-    fully enclose the dirty regions, so selecting "faces bounded by seams"
-    would require re-deriving the same face set -- instead we simply persist
-    the dirty face indices as a mesh-level flag before the seam pass frees
-    the bmesh, and re-read it here).
+def _unwrap_dirty_faces(body_name: str, dirty_indices: list[int]) -> None:
+    """Edit-mode select the dirty faces (by index, via bmesh -- never via
+    view3d/click selection) and run the seam-based angle-based unwrap.
     """
+    dirty_set = set(dirty_indices)
     body = bpy.data.objects[body_name]
     me = body.data
-    dirty_layer = me.attributes.get(_DIRTY_ATTR_NAME)
-    if dirty_layer is None:
-        raise RuntimeError(
-            f"p7_uv_atlas: expected face attribute {_DIRTY_ATTR_NAME!r} on {body_name!r} "
-            "(internal bug: _resegment_body must write it before _unwrap_dirty_faces runs)"
-        )
-    dirty_values = [bool(v.value) for v in dirty_layer.data]
 
     bpy.ops.object.select_all(action="DESELECT")
     bpy.context.view_layer.objects.active = body
@@ -299,17 +298,11 @@ def _unwrap_dirty_faces(body_name: str) -> None:
     bm = bmesh.from_edit_mesh(me)
     bm.faces.ensure_lookup_table()
     for f in bm.faces:
-        f.select = dirty_values[f.index] if f.index < len(dirty_values) else False
+        f.select = f.index in dirty_set
     bmesh.update_edit_mesh(me)
 
     bpy.ops.uv.unwrap(method="ANGLE_BASED", margin=0.003, correct_aspect=True)
     bpy.ops.object.mode_set(mode="OBJECT")
-
-    # Clean up the scratch attribute -- it is purely an internal handoff.
-    me.attributes.remove(dirty_layer)
-
-
-_DIRTY_ATTR_NAME = "_p7_dirty_face"
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +311,12 @@ _DIRTY_ATTR_NAME = "_p7_dirty_face"
 
 
 def _deliverable_object_names(ctx: PipelineContext) -> list[str]:
+    """Every ctx.names role that represents a deliverable mesh object.
+
+    Body is always included when registered; eyes/teeth/tongue are added
+    only if that role exists yet (p5/p6 are feature-flagged and may not have
+    run, or may not exist at all in the current pipeline build).
+    """
     names: list[str] = []
     seen: set[str] = set()
     for role in _DELIVERABLE_ROLE_KEYS:
@@ -327,8 +326,6 @@ def _deliverable_object_names(ctx: PipelineContext) -> list[str]:
             if obj.type == "MESH":
                 names.append(name)
                 seen.add(name)
-    if "body" not in [r for r in _DELIVERABLE_ROLE_KEYS if ctx.names.get(r) in seen]:
-        pass  # body is always included above when present in ctx.names; nothing further to do
     return names
 
 
