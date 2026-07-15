@@ -351,15 +351,13 @@ def _pack_islands_multi_object(object_names: list[str], active_name: str) -> Non
     for name in object_names:
         obj = bpy.data.objects[name]
         bm = bmesh.from_edit_mesh(obj.data)
-        uvl = bm.loops.layers.uv.active
         for f in bm.faces:
             f.select = True
-        if uvl is not None:
-            for f in bm.faces:
-                for l in f.loops:
-                    l[uvl].select = True
-                    if hasattr(l[uvl], "select_edge"):
-                        l[uvl].select_edge = True
+        # Note: BMLoopUV in this Blender version exposes only `.uv`/`.pin_uv`
+        # (no per-loop UV `.select`) -- mesh-domain face selection alone is
+        # sufficient for uv.pack_islands to consider these faces (verified
+        # empirically: it packs correctly across multiple edit-mode objects
+        # from face.select alone).
         bmesh.update_edit_mesh(obj.data)
 
     try:
