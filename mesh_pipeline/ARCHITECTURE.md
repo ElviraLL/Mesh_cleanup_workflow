@@ -1,0 +1,111 @@
+# Pipeline architecture contract
+
+This file is the binding interface spec for all `mesh_pipeline` modules. Phase
+implementations must conform to it exactly. Read `PLAN.md` and `docs/` for domain
+rationale; this file defines the code contract.
+
+## Runtime target
+
+- Blender 4.x headless: `blender -b -P mesh_pipeline/cli.py -- <args>`, or the `bpy`
+  pip wheel (`python -m mesh_pipeline.cli <args>`). Code must work in both.
+- Dependencies: Python stdlib + `bpy`. YAML config requires PyYAML in Blender's
+  Python (`.json` config accepted as fallback, same structure).
+- **Never** use operators requiring a view/window context (`bpy.ops.view3d.*`,
+  screenshots). QA visuals come from `bpy.ops.render.render(write_still=True)` with
+  explicitly created cameras.
+
+## Core types (`mesh_pipeline/context.py`)
+
+```python
+@dataclass
+class PhaseResult:
+    phase: str                    # e.g. "p2_weld_split"
+    status: str                   # "ok" | "needs_review" | "failed"
+    metrics: dict                 # JSON-serializable before/after numbers
+    failures: list[str]           # assertion failure messages (empty when ok)
+    notes: list[str]              # informational messages
+
+class PipelineContext:
+    job_dir: Path                 # contains input/ output/ snapshots/ qa_renders/
+    names: dict[str, str]         # role -> object name: "body", "eye_l", "eye_r",
+                                  # "teeth_u", "teeth_l", "tongue", plus dynamic roles
+    backup_names: dict[str, str]  # role -> backup object name (bake sources)
+
+    def obj(self, role: str) -> bpy.types.Object   # ALWAYS re-fetch bpy.data.objects[name]
+    def save_snapshot(self, tag: str) -> Path      # snapshots/<tag>.blend via save_as_mainfile
+    def ensure_object_mode(self) -> None
+```
+
+Rules encoded here (from docs, still apply headless):
+- Never cache `bpy.types.Object` across operator calls — store names, re-fetch.
+- After moving/scaling objects call `bpy.context.view_layer.update()` before reading
+  `matrix_world`.
+- Detect operator-created objects by name-set difference, never `context.active_object`.
+
+## Phase module contract (`mesh_pipeline/phases/pN_*.py`)
+
+Each phase module exposes exactly:
+
+```python
+PHASE_NAME = "pN_shortname"
+DESTRUCTIVE = True | False        # True -> runner snapshots pre_pN.blend first
+
+def run(ctx: PipelineContext, cfg: dict) -> PhaseResult: ...
+```
+
+- `cfg` is the full validated config dict; phases read their own section.
+- Phases NEVER call `sys.exit`, never swallow exceptions silently. An unexpected
+  exception propagates; the runner converts it to status `failed`.
+- Phases record before/after metrics in `PhaseResult.metrics` (e.g.
+  `{"components_before": 41230, "components_after": 7}`).
+- Phases set `needs_review` themselves only for domain conditions the assertion table
+  covers; the runner also applies `qa/assertions.py` checks after each phase.
+- Feature-flagged phases (p5, p6) return `status="ok"`, `notes=["skipped: disabled"]`
+  immediately when their flag is off.
+
+## Runner behavior (`cli.py`)
+
+Order: p0, p1, p2, p3, p4, p5, p6, p7, p8, p9.
+
+Per phase: (1) if DESTRUCTIVE, `ctx.save_snapshot(f"pre_{PHASE_NAME}")`; (2) run;
+(3) run assertion checks; (4) append result to `report.json`. On `needs_review` or
+`failed`: save `snapshots/failed_<PHASE_NAME>.blend`, render QA views, write report,
+**stop** (exit code 2 for needs_review, 1 for failed, 0 for success).
+
+CLI args (after `--`): `--input <mesh.glb>` (also .fbx/.obj), `--config <yaml|json>`,
+`--job-dir <dir>`, `--start-phase <name>` (resume: opens `snapshots/pre_<name>.blend`),
+`--only-phase <name>` (debug).
+
+## Assertions (`qa/assertions.py`)
+
+```python
+def check(phase_name: str, ctx, cfg, metrics: dict) -> list[str]  # [] = pass
+```
+
+Implements the PLAN.md table (P2 component count, P3 deletion band, P4 boundary
+z-bands, P5 teeth recess, P6 eye asymmetry with one auto local-visibility retry,
+P7 island count/overlap, P8 non-empty bake, P9 exact tri-tri penetration = 0).
+
+## Report (`report.py`)
+
+`report.json` schema:
+```json
+{
+  "input": {...}, "config_path": "...", "started_at": "...", "finished_at": "...",
+  "status": "done|needs_review|failed",
+  "phases": [ {PhaseResult fields + "duration_s"} ]
+}
+```
+Written atomically (temp file + rename) after every phase so a crash leaves a valid
+partial report.
+
+## Shared geometry helpers (`mesh_pipeline/geom.py`)
+
+Pure-Python/bmesh utilities used by multiple phases — keep bpy-optional where
+possible so unit tests can run without Blender:
+- `fibonacci_sphere(n)` -> list of unit direction tuples (pure python)
+- `connected_components(bm)` -> list of vert-index sets
+- `uv_island_count(me)` union-find (from docs snippets)
+- `boundary_loop_histogram(bm)` union-find over boundary edges
+- axis-label segmentation + region absorption helpers (pure logic on adjacency
+  graphs, taking plain data structures, so they are testable without bpy)
