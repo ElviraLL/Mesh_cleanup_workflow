@@ -99,6 +99,27 @@ P7 island count/overlap, P8 non-empty bake, P9 exact tri-tri penetration = 0).
 Written atomically (temp file + rename) after every phase so a crash leaves a valid
 partial report.
 
+## Metrics key contract (phases -> assertions)
+
+`qa/assertions.py` reads these exact keys from `PhaseResult.metrics`. Phases MUST
+emit them (assertions treat a missing key as a failure, not a pass):
+
+| Phase | Required metrics keys |
+|---|---|
+| p0_diagnose | `verts`, `faces`, `components`, `boundary_edges`, `nonmanifold_edges`, `uv_islands` (int or null), `materials` (list) |
+| p1_backup | `backed_up` (list of object names), `backup_collection` |
+| p2_weld_split | `components_before`, `components_after`, `weld_distance`, `verts_merged`, `parts` (dict role->name for classified parts) |
+| p3_hidden_geo | `parts_deleted` (list), `faces_before`, `faces_deleted`, `deleted_face_ratio` (0..1) |
+| p4_topology | `boundary_edges_before`, `boundary_edges_after`, `boundary_by_zband` (dict zband->count; zbands: `"body"`, `"legs"`, `"head_hair"`), `holes_filled`, `flaps_deleted`, `fins_deleted` |
+| p5_mouth | `skipped` (bool), `teeth_recess_mm` (float), `opening_z_range` ([lo,hi]), `teeth_z_range` ([lo,hi]) |
+| p6_eyes | `skipped` (bool), `clearance_l`, `clearance_r`, `asymmetry_ratio` (abs(l-r)/max(l,r)), `local_visibility_retried` (bool) |
+| p7_uv_atlas | `uv_islands_before`, `uv_islands_after`, `island_overlap_count` |
+| p8_bake | `channels` (list), `atlas_stats` (dict channel -> {mean, nonzero_ratio}) |
+| p9_export | `penetration_count`, `export_path`, `object_names` (list) |
+
+When a feature-flagged phase is skipped it sets `skipped: true` and assertions
+pass it unconditionally.
+
 ## Shared geometry helpers (`mesh_pipeline/geom.py`)
 
 Pure-Python/bmesh utilities used by multiple phases — keep bpy-optional where

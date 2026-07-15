@@ -7,7 +7,7 @@ input:
   up_axis: auto          # detect + normalize
 
 weld:
-  sweep: [1e-4, 5e-3]    # probe on throwaway bmesh copies
+  sweep: [1.0e-4, 5.0e-3] # probe on throwaway bmesh copies (PyYAML needs the decimal point to parse these as floats, not strings)
   auto_pick:
     strategy: max_merge_rate
     max_merge_rate: 0.03 # first threshold before merge-rate exceeds 3% of verts

@@ -11,6 +11,7 @@ lazily inside methods that actually touch the Blender scene.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -70,14 +71,33 @@ class PipelineContext:
         """Save a copy of the current .blend to snapshots/<tag>.blend.
 
         Uses copy=True so the in-memory session (current filepath, undo stack)
-        is left untouched -- this is a side-save, not a "save as".
+        is left untouched -- this is a side-save, not a "save as". The name
+        registry is saved alongside as <tag>.names.json so a resumed run
+        (--start-phase) can restore ctx.names / ctx.backup_names.
         """
         import bpy
 
         path = self.job_dir / "snapshots" / f"{tag}.blend"
         path.parent.mkdir(parents=True, exist_ok=True)
         bpy.ops.wm.save_as_mainfile(filepath=str(path), copy=True)
+        registry = {"names": self.names, "backup_names": self.backup_names}
+        (path.with_suffix(".names.json")).write_text(
+            json.dumps(registry, indent=2, sort_keys=True)
+        )
         return path
+
+    def load_registry(self, tag: str) -> bool:
+        """Restore names/backup_names from snapshots/<tag>.names.json.
+
+        Returns True if the registry file existed and was loaded.
+        """
+        path = self.job_dir / "snapshots" / f"{tag}.names.json"
+        if not path.exists():
+            return False
+        registry = json.loads(path.read_text())
+        self.names = dict(registry.get("names", {}))
+        self.backup_names = dict(registry.get("backup_names", {}))
+        return True
 
     def ensure_object_mode(self) -> None:
         """Defensively force every object into OBJECT mode.
