@@ -80,6 +80,24 @@ burn the main context on mechanical file reading or long command output.
    don't trust `BVHTree.overlap()` alone for penetration — confirm with exact
    triangle–triangle tests.
 
+## Runtime quirks (hard-won — do not rediscover)
+
+- **`import bpy` must come before `import bmesh`** with the pip `bpy` wheel;
+  the reverse order raises ModuleNotFoundError.
+- **Pin `PYTHONHASHSEED=0`** for reproducible runs — randomized string hashing
+  was observed to change UV packing results between otherwise-identical runs.
+  The CLI warns when it isn't pinned.
+- **Headless Workbench/EEVEE rendering needs GL**; without libEGL the render
+  SIGABRTs the whole process (uncatchable). On bare containers:
+  `apt install libegl1 libegl-mesa0 libgl1-mesa-dri` (Mesa software GL).
+  `qa/render.py` preflights this and degrades to a report note.
+- **Boolean modifiers need `material_mode='TRANSFER'`** (Blender 5.x defaults
+  to INDEX) or cutter materials never reach the carved cavity faces — the
+  mouth-bag/eye-socket material trick silently fails without it.
+- Boolean-created cavity faces inherit **degenerate UVs** from UV-less
+  cutters; p7 always re-unwraps the Mouth_Interior / Eye_Socket_Interior
+  material slots for this reason.
+
 ## Running the pipeline
 
 ```bash
