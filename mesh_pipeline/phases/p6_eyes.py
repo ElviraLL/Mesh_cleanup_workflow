@@ -26,6 +26,9 @@ import math
 
 from mesh_pipeline.context import PhaseResult
 from mesh_pipeline.geom import fibonacci_sphere
+from mesh_pipeline.phases.p5_mouth import _get_or_create_material
+
+_SOCKET_INTERIOR_MAT = "Eye_Socket_Interior"
 
 PHASE_NAME = "p6_eyes"
 DESTRUCTIVE = True
@@ -274,6 +277,18 @@ def _carve_eye_opening(body, bvh, eyes_cfg: dict, info: dict, front_sign: int) -
     me = bpy.data.meshes.new("EyeCutter_mesh")
     bm.to_mesh(me)
     bm.free()
+
+    # Assign a dark socket-interior material to the cutter BEFORE the boolean:
+    # material_mode='TRANSFER' stamps it onto the carved cavity walls, exactly
+    # like p5's Mouth_Interior. Without this the cavity faces inherit the
+    # body's own material slot 0 (skin) with non-confetti UVs, which dilutes
+    # p7's per-material confetti ratio and can silently disable the body
+    # re-unwrap (found by the e2e run: ratio 0.826 < 0.9 threshold).
+    mat = _get_or_create_material(_SOCKET_INTERIOR_MAT, (0.02, 0.01, 0.01, 1.0))
+    me.materials.append(mat)
+    for p in me.polygons:
+        p.material_index = 0
+
     obj = bpy.data.objects.new("EyeCutter", me)
     bpy.context.scene.collection.objects.link(obj)
     obj.location = (center.x, center_y, fissure_z)

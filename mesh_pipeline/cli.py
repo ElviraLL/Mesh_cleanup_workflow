@@ -241,6 +241,28 @@ def resolve_scene_setup(
         import_input_mesh(dest)
 
 
+def hash_seed_note() -> str | None:
+    """Warn when PYTHONHASHSEED is not pinned.
+
+    Empirically (see tests/test_e2e.py): with a randomized hash seed,
+    repeated runs on identical input produced differing p7 island packing
+    (island_overlap_count varied run-to-run) while all other metrics stayed
+    bit-identical. Until the exact order-dependence is isolated, pin
+    PYTHONHASHSEED=0 for reproducible pipelines (batch regression runs in
+    particular should always pin it).
+    """
+    import os
+
+    seed = os.environ.get("PYTHONHASHSEED")
+    if seed is None or seed == "random":
+        return (
+            "PYTHONHASHSEED is not pinned; UV packing results may vary "
+            "between otherwise-identical runs. Set PYTHONHASHSEED=0 for "
+            "reproducible output."
+        )
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(find_cli_argv(sys.argv if argv is None else argv))
 
@@ -283,6 +305,10 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     report = Report(input_path=str(input_path), config_path=str(config_path))
+    note = hash_seed_note()
+    if note:
+        print(f"[mesh_pipeline] warning: {note}", file=sys.stderr)
+        report.input["warning"] = note
     report_path = job_dir / "report.json"
     report.write_atomic(report_path)
 

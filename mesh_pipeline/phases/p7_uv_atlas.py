@@ -59,6 +59,15 @@ DESTRUCTIVE = True
 
 UV_LAYER_NAME = "UVMap"
 
+# Material names p5/p6 stamp onto boolean-created cavity faces. Those faces
+# inherit no real UVs from the cutters, so they must always be re-unwrapped
+# (see _dirty_face_indices). Imported from the owning phase modules so a
+# rename there cannot silently drift.
+from mesh_pipeline.phases.p5_mouth import _MOUTH_INTERIOR_MAT
+from mesh_pipeline.phases.p6_eyes import _SOCKET_INTERIOR_MAT
+
+_ALWAYS_DIRTY_MATERIALS = {_MOUTH_INTERIOR_MAT, _SOCKET_INTERIOR_MAT}
+
 
 # A material-slot's own faces are considered "dirty" (confetti / no clean
 # unwrap) once its island count reaches this fraction of its own face count.
@@ -171,7 +180,10 @@ def _resegment_body(
     bm.edges.ensure_lookup_table()
 
     uvl = bm.loops.layers.uv.active
-    dirty_indices = _dirty_face_indices(bm, uvl, keep_clean, notes)
+    mat_names = [
+        (slot.material.name if slot.material else "") for slot in body.material_slots
+    ]
+    dirty_indices = _dirty_face_indices(bm, uvl, keep_clean, mat_names, notes)
 
     region_count = 0
     if dirty_indices:
@@ -208,13 +220,22 @@ def _resegment_body(
     return dirty_indices, region_count
 
 
-def _dirty_face_indices(bm, uvl, keep_clean: bool, notes: list[str]) -> list[int]:
+def _dirty_face_indices(
+    bm, uvl, keep_clean: bool, mat_names: list[str], notes: list[str]
+) -> list[int]:
     """Faces that need a fresh unwrap, decided per material slot.
 
     If `keep_clean` is off, or there is no UV layer at all, every face is
     dirty. Otherwise each material slot's faces are tested independently:
     the slot is "confetti" (dirty) once its own island count reaches
     `_CONFETTI_RATIO` of its own face count.
+
+    Boolean-created interior slots (mouth cavity, eye sockets) are ALWAYS
+    dirty regardless of their island count: the p5/p6 cutters carry no UV
+    layer, so the faces they stamp onto the body inherit degenerate UVs
+    stacked near the origin -- which look like "one clean island" to the
+    confetti test but overlap everything after packing (found by the e2e
+    full run: island_overlap_count=7, all from cavity slots).
     """
     n = len(bm.faces)
     if not keep_clean or uvl is None:
@@ -230,6 +251,15 @@ def _dirty_face_indices(bm, uvl, keep_clean: bool, notes: list[str]) -> list[int
 
     dirty: list[int] = []
     for mat_idx, face_idxs in sorted(by_mat.items()):
+        mat_name = mat_names[mat_idx] if 0 <= mat_idx < len(mat_names) else ""
+        if mat_name in _ALWAYS_DIRTY_MATERIALS:
+            notes.append(
+                f"dirty-face decision: material_index={mat_idx} ({mat_name!r}) "
+                f"faces={len(face_idxs)} -> DIRTY (boolean-created interior, "
+                "always re-unwrapped)"
+            )
+            dirty.extend(face_idxs)
+            continue
         islands = _island_count_subset(bm, uvl, face_idxs)
         is_dirty = islands >= _CONFETTI_RATIO * len(face_idxs)
         notes.append(
