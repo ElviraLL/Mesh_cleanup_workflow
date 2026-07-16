@@ -201,13 +201,18 @@ def _world_bbox(obj):
     return (min(xs), max(xs)), (min(ys), max(ys)), (min(zs), max(zs))
 
 
-def _read_p5_opening_z_range(ctx: PipelineContext) -> tuple[float, float] | None:
-    """Best-effort read of p5_mouth's opening_z_range from report.json.
+def _read_p5_mouth_z_range(ctx: PipelineContext) -> tuple[float, float] | None:
+    """Best-effort read of p5_mouth's cavity z-range from report.json.
 
-    p9 only receives `ctx`/`cfg`, not earlier phases' metrics, so this reaches
-    into report.json (written after every phase, per ARCHITECTURE.md) to find
-    it -- if the report is missing, unreadable, or p5 was skipped/hasn't run,
-    the caller falls back to the documented z-band heuristic.
+    Prefers `bag_z_range` (the full interior cavity, where teeth/tongue
+    actually live -- including a kept 'reference_kept' teeth object, which
+    can be much taller than the closed-lips slit) over `opening_z_range`
+    (just the thin closed-lips slit at the outer skin surface): teeth sitting
+    inside the bag but outside the thin slit would otherwise fall outside the
+    opening window and register as false penetrations. Falls back to
+    `opening_z_range` if `bag_z_range` isn't present (older report, or p5
+    couldn't measure the bag), then to the documented z-band heuristic if
+    neither is available (report missing/unreadable, p5 skipped/hasn't run).
     """
     report_path = ctx.job_dir / "report.json"
     if not report_path.exists():
@@ -222,12 +227,14 @@ def _read_p5_opening_z_range(ctx: PipelineContext) -> tuple[float, float] | None
         metrics = phase.get("metrics") or {}
         if metrics.get("skipped"):
             return None
-        rng = metrics.get("opening_z_range")
-        if isinstance(rng, (list, tuple)) and len(rng) == 2:
-            try:
-                return float(rng[0]), float(rng[1])
-            except (TypeError, ValueError):
-                return None
+        for key in ("bag_z_range", "opening_z_range"):
+            rng = metrics.get(key)
+            if isinstance(rng, (list, tuple)) and len(rng) == 2:
+                try:
+                    return float(rng[0]), float(rng[1])
+                except (TypeError, ValueError):
+                    continue
+        return None
     return None
 
 
@@ -236,10 +243,10 @@ def _opening_windows(ctx: PipelineContext, cfg: dict) -> list[tuple]:
 
     Eye windows are built directly from each present eyeball object's world
     bbox (centered on the eyeball, generously margined). The mouth window
-    prefers p5_mouth's measured opening_z_range (see
-    `_read_p5_opening_z_range`); lacking that, it falls back to a documented
-    Z-up-humanoid heuristic z-band, x-bracketed to the central 40% of the
-    body's width.
+    prefers p5_mouth's measured bag_z_range, falling back to opening_z_range
+    (see `_read_p5_mouth_z_range`); lacking either, it falls back to a
+    documented Z-up-humanoid heuristic z-band, x-bracketed to the central 40%
+    of the body's width.
     """
     windows: list[tuple] = []
 
@@ -260,7 +267,7 @@ def _opening_windows(ctx: PipelineContext, cfg: dict) -> list[tuple]:
         height = zmax - zmin
         cx = (xmin + xmax) / 2.0
 
-        z_range = _read_p5_opening_z_range(ctx)
+        z_range = _read_p5_mouth_z_range(ctx)
         if z_range is None:
             z_range = (
                 zmin + _MOUTH_Z_FRACTION[0] * height,

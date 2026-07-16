@@ -119,7 +119,9 @@ def _p4(ctx, cfg, metrics) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# p5 -- teeth recess 1-2mm behind lip rim; arches overlap opening z-range
+# p5 -- closed lips (thin slit) + topologically split; teeth overlap the BAG
+# (interior cavity), not the slit; teeth recess 1-2mm only in carved_closed
+# mode (reference_kept keeps the input's own teeth position, unmeasured).
 # ---------------------------------------------------------------------------
 
 
@@ -127,22 +129,55 @@ def _p5(ctx, cfg, metrics) -> list[str]:
     if _skip_if_flagged(metrics):
         return []
     failures: list[str] = []
-    if not _require(metrics, ["teeth_recess_mm", "opening_z_range", "teeth_z_range"], failures):
+    required = [
+        "mode",
+        "teeth_recess_mm",
+        "opening_z_range",
+        "bag_z_range",
+        "teeth_z_range",
+        "lip_gap_mm_measured",
+        "lips_topologically_split",
+    ]
+    if not _require(metrics, required, failures):
         return failures
-    recess = metrics["teeth_recess_mm"]
-    if not (isinstance(recess, (int, float)) and 1.0 <= recess <= 2.0):
-        failures.append(f"teeth_recess_mm: expected in [1.0, 2.0], got {recess!r}")
+
+    mode = metrics["mode"]
 
     opening = metrics["opening_z_range"]
-    teeth = metrics["teeth_z_range"]
     if not _valid_range(opening):
         failures.append(f"opening_z_range: expected a [lo, hi] pair, got {opening!r}")
+
+    lip_gap_measured = metrics["lip_gap_mm_measured"]
+    lip_gap_cfg = cfg.get("mouth", {}).get("lip_gap_mm", 0.4)
+    limit = 2.5 * lip_gap_cfg
+    if not (isinstance(lip_gap_measured, (int, float)) and lip_gap_measured <= limit):
+        failures.append(
+            f"lip_gap_mm_measured: expected <= {limit} (2.5x mouth.lip_gap_mm={lip_gap_cfg}), "
+            f"got {lip_gap_measured!r}"
+        )
+
+    if mode == "carved_closed":
+        recess = metrics["teeth_recess_mm"]
+        if not (isinstance(recess, (int, float)) and 1.0 <= recess <= 2.0):
+            failures.append(
+                f"teeth_recess_mm: expected in [1.0, 2.0] when mode=='carved_closed', got {recess!r}"
+            )
+
+    bag = metrics["bag_z_range"]
+    teeth = metrics["teeth_z_range"]
+    if not _valid_range(bag):
+        failures.append(f"bag_z_range: expected a [lo, hi] pair, got {bag!r}")
     elif not _valid_range(teeth):
         failures.append(f"teeth_z_range: expected a [lo, hi] pair, got {teeth!r}")
-    elif not _ranges_overlap(opening, teeth):
+    elif not _ranges_overlap(bag, teeth):
         failures.append(
-            f"teeth_z_range {teeth!r} does not overlap opening_z_range {opening!r}"
+            f"teeth_z_range {teeth!r} does not overlap bag_z_range {bag!r}"
         )
+
+    split_ok = metrics["lips_topologically_split"]
+    if split_ok is not True:
+        failures.append(f"lips_topologically_split: expected true, got {split_ok!r}")
+
     return failures
 
 

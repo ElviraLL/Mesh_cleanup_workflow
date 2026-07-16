@@ -211,6 +211,191 @@ def body_xz_points(obj, max_samples: int = 4000) -> list[tuple[float, float]]:
     return pts
 
 
+def find_lip_line(body_obj, bbox: dict, notes: list):
+    """Detect the lip line: boundary/sharp-crease edges in the front mouth region.
+
+    Shared by p5_mouth (lip-line search for the closed-lips mouth-bag cutter)
+    and p3_hidden_geo (pre-cleanup mouth-region face protection, so real
+    mouth-bag/teeth interior geometry on the input mesh survives P3's hidden-
+    geometry deletion pass) -- moved here from p5_mouth.py so both phases can
+    import one implementation instead of duplicating the heuristic.
+
+    Heuristic (documented per task spec):
+    1. "Head z-band" = geom.head_z_band(body world verts), which finds the
+       contiguous top z-slices before the body's x-width profile "explodes"
+       into shoulders/arms (see its docstring for the avatar_003 calibration
+       numbers). This replaces a fixed "top 30% of bbox height" rule, which
+       was too permissive: on avatar_003 that rule's z-band reached down
+       into the neck/upper chest and let a necklace pendant's crease (zfrac
+       0.82) get misdetected as the lip line. The top 2% of the resulting
+       band is still excluded (scalp/hair). Falls back to the fixed top-30%
+       rule, with a note, if geom.head_z_band returns None (degenerate
+       geometry / no band found).
+    2. Front axis: within that z-band, compute the median |y| ("head radius")
+       and compare how far the extreme +Y vertex and extreme -Y vertex
+       protrude past it. AI-generated heads typically model a distinct nose
+       bump on the front but keep the back of the skull close to the smooth
+       median radius, so the side with the larger protrusion is called front.
+       This is a heuristic and will misfire on faces with no modeled nose
+       bump (e.g. a bare sphere) -- see the caller's needs_review fallback.
+    3. Candidate lip edges = boundary edges OR marked-sharp edges (BMEdge.smooth
+       == False) OR high dihedral-angle edges (>35 deg), restricted to the
+       front half of the head z-band.
+    4. Cluster candidates by shared-vertex adjacency (union-find); the winning
+       cluster is the widest-in-x/thinnest-in-z one (a lip line is a roughly
+       horizontal band across the mouth, not a vertical crease).
+
+    Returns (fissure_z, mouth_x, front_sign, lip_surface_y) or None.
+    """
+    import bmesh
+
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(body_obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        mat = body_obj.matrix_world
+
+        zmin, zmax = bbox["min"].z, bbox["max"].z
+        height = zmax - zmin
+        head_band = head_z_band(body_xz_points(body_obj))
+        if head_band is not None:
+            band_lo, band_hi = head_band
+            head_lo = band_lo
+            head_hi = min(band_hi, zmax - 0.02 * height)  # still exclude scalp/hair tip
+            notes.append(
+                f"head z-band (geom.head_z_band): [{head_lo:.4f},{head_hi:.4f}]"
+            )
+        else:
+            head_lo = zmax - 0.30 * height
+            head_hi = zmax - 0.02 * height
+            notes.append(
+                "geom.head_z_band returned None (degenerate/no band found); "
+                "falling back to fixed top-30% head z-band rule "
+                f"[{head_lo:.4f},{head_hi:.4f}]"
+            )
+
+        # x-centrality constraint: the mouth sits on the sagittal plane. In a
+        # T-pose the wrists/hands are at the SAME height as the chin, and a
+        # glove seam there is exactly the kind of sharp-edge cluster the
+        # detector otherwise latches onto (avatar_003: lip line "found" at
+        # x=0.46 on the wrist -> mouth carved into the arm, caught by p9's
+        # penetration test). Restrict everything to the central band of the
+        # x extent.
+        x_center = (bbox["min"].x + bbox["max"].x) / 2.0
+        x_half_limit = 0.10 * max(bbox["max"].x - bbox["min"].x, 1e-9)
+
+        def _central(wco) -> bool:
+            return abs(wco.x - x_center) <= x_half_limit
+
+        # front-axis heuristic
+        band_ys = []
+        for v in bm.verts:
+            wco = mat @ v.co
+            if head_lo <= wco.z <= head_hi and _central(wco):
+                band_ys.append(wco.y)
+        if not band_ys:
+            notes.append("lip detection: no vertices found in the candidate head z-band")
+            return None
+        band_ys_sorted = sorted(abs(y) for y in band_ys)
+        median_y_abs = band_ys_sorted[len(band_ys_sorted) // 2]
+        y_max = max(band_ys)
+        y_min = min(band_ys)
+        protrusion_pos = y_max - median_y_abs
+        protrusion_neg = (-y_min) - median_y_abs
+        front_sign = 1 if protrusion_pos >= protrusion_neg else -1
+        notes.append(
+            "front-axis heuristic (mouth): within head z-band "
+            f"[{head_lo:.4f},{head_hi:.4f}], compared how far the extreme +Y "
+            f"({protrusion_pos:.4f} past median|y|={median_y_abs:.4f}) and -Y "
+            f"({protrusion_neg:.4f} past median) vertices protrude (nose-bump "
+            f"asymmetry) -> front_sign={front_sign}"
+        )
+
+        candidates = []
+        for e in bm.edges:
+            v0, v1 = e.verts
+            w0 = mat @ v0.co
+            w1 = mat @ v1.co
+            mid_z = (w0.z + w1.z) / 2.0
+            mid_y = (w0.y + w1.y) / 2.0
+            if not (head_lo <= mid_z <= head_hi):
+                continue
+            if front_sign * mid_y <= 0:
+                continue
+            mid = (w0 + w1) / 2.0
+            if not _central(mid):
+                continue
+            is_boundary = e.is_boundary
+            is_sharp = not e.smooth
+            is_crease = False
+            if len(e.link_faces) == 2:
+                is_crease = e.calc_face_angle() > math.radians(35)
+            if is_boundary or is_sharp or is_crease:
+                candidates.append(e)
+
+        if not candidates:
+            notes.append(
+                "lip detection: no boundary/sharp/crease edges found on the front "
+                "side of the head z-band"
+            )
+            return None
+
+        vert_to_edges: dict = {}
+        for i, e in enumerate(candidates):
+            for v in e.verts:
+                vert_to_edges.setdefault(v.index, []).append(i)
+        ds = DisjointSet(len(candidates))
+        for idxs in vert_to_edges.values():
+            for a, b in zip(idxs, idxs[1:]):
+                ds.union(a, b)
+        groups = ds.groups()
+
+        best_members = None
+        best_verts_world = None
+        best_score = -1.0
+        for members in groups.values():
+            if len(members) < 3:
+                continue
+            verts_world = []
+            for i in members:
+                e = candidates[i]
+                for v in e.verts:
+                    verts_world.append(mat @ v.co)
+            xs = [p.x for p in verts_world]
+            zs = [p.z for p in verts_world]
+            x_extent = max(xs) - min(xs)
+            z_extent = (max(zs) - min(zs)) + 1e-6
+            aspect = x_extent / z_extent
+            score = aspect * len(members)
+            if aspect > 1.0 and score > best_score:
+                best_score = score
+                best_members = members
+                best_verts_world = verts_world
+
+        if best_members is None:
+            notes.append(
+                "lip detection: front-side candidate edges did not form a "
+                "wide-x/thin-z (lip-like) cluster"
+            )
+            return None
+
+        xs = [p.x for p in best_verts_world]
+        ys = [p.y for p in best_verts_world]
+        zs = [p.z for p in best_verts_world]
+        fissure_z = sum(zs) / len(zs)
+        mouth_x = sum(xs) / len(xs)
+        lip_surface_y = max(ys) if front_sign > 0 else min(ys)
+        notes.append(
+            f"lip line detected: {len(best_members)} candidate edges, "
+            f"fissure_z={fissure_z:.4f}, mouth_x={mouth_x:.4f}, "
+            f"lip_surface_y={lip_surface_y:.4f}"
+        )
+        return fissure_z, mouth_x, front_sign, lip_surface_y
+    finally:
+        bm.free()
+
+
 def bm_connected_components(bm) -> list[set[int]]:
     """Vertex-index connected components of a bmesh, via edge adjacency."""
     bm.verts.ensure_lookup_table()

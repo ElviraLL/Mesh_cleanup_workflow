@@ -54,8 +54,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "mouth": {
         "enabled": True,  # feature flag -- pipeline must run fine with this off
-        "cutter_radii": [0.020, 0.042, 0.0085],  # per 1-unit body height, scale accordingly
-        "teeth_recess_mm": [1, 2],  # assertion range behind lip rim
+        "cutter_radii": [0.020, 0.042, 0.0085],  # per 1-unit body height, scale accordingly (rx, ry fallback-rz)
+        "bag_height": 0.012,  # per 1-unit body height -- interior cavity half-height (rz) for the closed-lips bag
+        "lip_gap_mm": 0.4,  # target closed-lip slit height at the outer skin surface
+        "teeth_recess_mm": [1, 2],  # assertion range behind lip rim (carved_closed mode only)
     },
     "eyes": {
         "enabled": True,  # feature flag
@@ -84,6 +86,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "eye_r": "Eye_R",
             "teeth_u": "Teeth_Upper",
             "teeth_l": "Teeth_Lower",
+            "teeth": "Teeth",  # reference_kept mode: existing input teeth part, kept as-is
             "tongue": "Tongue",
         },
         "hierarchy": "parent_under_body",  # parented, NOT joined
@@ -220,6 +223,8 @@ def _validate(cfg: dict[str, Any]) -> list[str]:
     check(isinstance(mouth["enabled"], bool), "mouth.enabled must be a bool")
     cr = mouth["cutter_radii"]
     check(isinstance(cr, list) and len(cr) == 3 and all(_is_number(v) and v > 0 for v in cr), "mouth.cutter_radii must be a list of 3 positive numbers")
+    check(_is_number(mouth["bag_height"]) and mouth["bag_height"] > 0, "mouth.bag_height must be a positive number")
+    check(_is_number(mouth["lip_gap_mm"]) and mouth["lip_gap_mm"] > 0, "mouth.lip_gap_mm must be a positive number")
     trm = mouth["teeth_recess_mm"]
     check(isinstance(trm, list) and len(trm) == 2 and all(_is_number(v) for v in trm) and trm[0] <= trm[1], "mouth.teeth_recess_mm must be an ascending [min, max] pair")
 

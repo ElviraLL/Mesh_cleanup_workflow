@@ -22,7 +22,12 @@ Two passes, per docs/blender-body-mesh-cleanup.md Phase 3 ("the core trick"):
      The visible set is dilated by `hidden_geometry.dilate_rings` adjacency
      rings BEFORE deletion (protects concave detail like nostrils/ears), then
      interior faces are deleted, followed by wire edges/loose verts, then
-     orphan islands smaller than 40 verts.
+     orphan islands smaller than 40 verts. Before deletion, a mouth-region
+     protection box (built from geom.find_lip_line -- the same lip-line
+     detector p5_mouth uses) exempts any body faces near the lip line from
+     Pass B, so a pre-existing mouth-bag interior / teeth-adjacent geometry
+     on the input mesh survives for p5_mouth to find and reuse (see 'teeth'
+     in _NEVER_DELETE_ROLES for the whole-part side of the same protection).
 
 DESTRUCTIVE: the runner snapshots snapshots/pre_p3_hidden_geo.blend before
 this module runs.
@@ -47,7 +52,19 @@ _MAX_PART_SAMPLE_VERTS = 200
 _FACE_CHUNK = 20_000
 _MIN_ISLAND_VERTS = 40
 _BACKUP_COLLECTION = "_backup_pre_cleanup"
-_NEVER_DELETE_ROLES = ("eye_l", "eye_r")
+# "teeth" added so a real teeth part on the input mesh (common on Trellis 2 /
+# AI avatar output, classified by p2_weld_split._classify_parts) survives
+# whole-part visibility deletion -- it sits behind closed lips and always
+# tests as internal, same as eyes sitting behind cornea/lid surfaces.
+_NEVER_DELETE_ROLES = ("eye_l", "eye_r", "teeth")
+# Mouth-region protection box (Pass B, body per-face pass), fractions of
+# body_height around the lip line found by geom.find_lip_line -- protects
+# any pre-existing mouth-bag interior/teeth-adjacent body faces from being
+# swept up as "fused inner layer" junk before p5_mouth runs.
+_MOUTH_PROTECT_X_HALF_FRAC = 0.06
+_MOUTH_PROTECT_Z_HALF_FRAC = 0.035
+_MOUTH_PROTECT_Y_INWARD_FRAC = 0.09
+_MOUTH_PROTECT_Y_SLOP_FRAC = 0.01  # small outward tolerance past the measured lip surface
 
 # geom.fibonacci_sphere's first direction is always exactly (0, 1, 0) (and in
 # general its points sit on tidy lat/long-ish rings). Humanoid meshes are
@@ -151,6 +168,57 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
 
     body_faces_before = len(bm.faces)
 
+    # mw is needed both for mouth-region protection (below) and for the
+    # occlusion BVH's self-occlusion triangles (further down) -- computed
+    # once here, before either use.
+    mw = body_obj.matrix_world.copy()
+
+    # ---- mouth-region face protection: candidate box (pre-cleanup lip detection) --
+    # Runs the SAME lip-line detector p5_mouth uses, on the body's CURRENT
+    # (pre-deletion) geometry, so any pre-existing mouth-bag interior/teeth
+    # geometry the input mesh already has (common on Trellis 2 / AI avatar
+    # output) survives this pass instead of being swept up as "fused inner
+    # layer" junk -- p5_mouth can then find and reuse it (its 'teeth'
+    # reference-mode check) instead of building duplicates. Only the
+    # CANDIDATE box is computed here; it is narrowed to the actually
+    # protected set further below, once vis_flag is known (see the
+    # connectivity-filter comment there for why).
+    mouth_box_candidates: set[int] = set()
+    mouth_cfg = cfg.get("mouth", {})
+    if mouth_cfg.get("enabled"):
+        body_bbox_mouth = _world_bbox(body_obj)
+        body_height_mouth = body_bbox_mouth["max"].z - body_bbox_mouth["min"].z
+        if body_height_mouth > 0:
+            lip = geom.find_lip_line(body_obj, body_bbox_mouth, notes)
+            if lip is not None:
+                fissure_z, mouth_x, front_sign, lip_surface_y = lip
+                x_half = _MOUTH_PROTECT_X_HALF_FRAC * body_height_mouth
+                z_half = _MOUTH_PROTECT_Z_HALF_FRAC * body_height_mouth
+                y_inward = _MOUTH_PROTECT_Y_INWARD_FRAC * body_height_mouth
+                y_slop = _MOUTH_PROTECT_Y_SLOP_FRAC * body_height_mouth
+                for f in bm.faces:
+                    c = mw @ f.calc_center_median()
+                    if abs(c.x - mouth_x) > x_half or abs(c.z - fissure_z) > z_half:
+                        continue
+                    depth = front_sign * (lip_surface_y - c.y)  # >0 further inward
+                    if -y_slop <= depth <= y_inward:
+                        mouth_box_candidates.add(f.index)
+                notes.append(
+                    f"mouth protection: {len(mouth_box_candidates)} candidate body face(s) "
+                    f"in the lip-line box (mouth_x={mouth_x:.4f}, fissure_z={fissure_z:.4f}); "
+                    "narrowed to those connected to the kept surface below"
+                )
+            else:
+                notes.append(
+                    "mouth protection: lip line not found pre-cleanup; protecting no faces"
+                )
+        else:
+            notes.append(
+                "mouth protection: body bbox has non-positive height; protecting no faces"
+            )
+    else:
+        notes.append("mouth protection: disabled (mouth.enabled=false); protecting no faces")
+
     surviving_objs = [
         o for o in bpy.data.objects if o.type == "MESH" and o.name not in backup_names
     ]
@@ -164,7 +232,6 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
     # The body's own current (not-yet-written-back) geometry, straight from bm
     # -- this must be part of the occlusion BVH too (self-occlusion in
     # concave regions), and using bm avoids relying on a stale evaluated mesh.
-    mw = body_obj.matrix_world.copy()
     body_tris = [tuple(mw @ l.vert.co for l in tri) for tri in bm.calc_loop_triangles()]
     tri_sources_b.append((body_obj.name, body_tris))
 
@@ -193,9 +260,48 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
             f[vis_layer] = 1  # nothing to occlude against; keep everything
 
     visible_idx = {f.index for f in bm.faces if f[vis_layer] == 1}
+
+    # ---- mouth-region face protection: connectivity filter -----------------
+    # A raw "protect everything in the lip-line box" would ALSO rescue any
+    # unrelated fused-inner-layer duplicate geometry that happens to fall
+    # inside the same box (verified empirically on the synthetic e2e fixture:
+    # its double-wall inner shell spans the full body height, so the naive
+    # box protection kept a chunk of it near the mouth too, and it is NOT
+    # mesh-connected to the outer skin there -- only at the poles, far away
+    # -- so preserving it left a ragged, non-manifold patch that inflated
+    # p4_topology's body-zband boundary-edge count from 0 to 145). Real
+    # mouth-bag/teeth geometry on an AI-generated mesh, by contrast, is
+    # normally welded to the outer skin at the lip opening. So: only protect
+    # a mouth_box_candidates face if it is reachable from an already-VISIBLE
+    # face via a chain of OTHER mouth_box_candidates faces (flood fill
+    # confined to the box) -- this keeps real, attached mouth-cavity
+    # geometry while still discarding disconnected duplicate-shell junk that
+    # merely happens to sit in the same box.
+    protected_idx: set[int] = set()
+    if mouth_box_candidates:
+        bm.faces.ensure_lookup_table()
+        frontier = [i for i in mouth_box_candidates if i in visible_idx]
+        protected_idx = set(frontier)
+        while frontier:
+            nxt = []
+            for fi in frontier:
+                f = bm.faces[fi]
+                for e in f.edges:
+                    for lf in e.link_faces:
+                        if lf.index in mouth_box_candidates and lf.index not in protected_idx:
+                            protected_idx.add(lf.index)
+                            nxt.append(lf.index)
+            frontier = nxt
+        notes.append(
+            f"mouth protection: {len(protected_idx)}/{len(mouth_box_candidates)} candidate "
+            "face(s) are connected to the kept surface and actually protected"
+        )
+
     visible_idx = _dilate(bm, visible_idx, dilate_rings)
 
-    delete_faces = [f for f in bm.faces if f.index not in visible_idx]
+    delete_faces = [
+        f for f in bm.faces if f.index not in visible_idx and f.index not in protected_idx
+    ]
     if delete_faces:
         bmesh.ops.delete(bm, geom=delete_faces, context="FACES_ONLY")
 
@@ -230,6 +336,7 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
         "faces_before": total_faces_before,
         "faces_deleted": faces_deleted,
         "deleted_face_ratio": deleted_face_ratio,
+        "faces_protected_mouth": len(protected_idx),
     }
 
     return PhaseResult(
@@ -240,6 +347,16 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def _world_bbox(obj) -> dict:
+    bpy.context.view_layer.update()
+    mat = obj.matrix_world
+    corners = [mat @ Vector(c) for c in obj.bound_box]
+    xs = [c.x for c in corners]
+    ys = [c.y for c in corners]
+    zs = [c.z for c in corners]
+    return {"min": Vector((min(xs), min(ys), min(zs))), "max": Vector((max(xs), max(ys), max(zs)))}
 
 
 def _backup_object_names() -> set[str]:
