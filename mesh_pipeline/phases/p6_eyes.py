@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 
+from mesh_pipeline import geom
 from mesh_pipeline.context import PhaseResult
 from mesh_pipeline.geom import fibonacci_sphere
 from mesh_pipeline.phases.p5_mouth import _get_or_create_material
@@ -69,20 +70,28 @@ def run(ctx, cfg: dict) -> PhaseResult:
         "eyes.fissure_offset_mm and the inscribed-sphere fit margin into scene units"
     ]
 
-    missing_roles = [r for r in ("eye_l", "eye_r") if r not in ctx.names]
     failures = []
     if "body" not in ctx.names:
         failures.append("p6_eyes: no 'body' role registered in ctx.names")
-    if missing_roles:
-        failures.append(
-            f"p6_eyes: missing eye role(s) {missing_roles} in ctx.names -- expected "
-            "from p2 classification; cannot carve/measure eyes"
-        )
     if failures:
         metrics = _empty_metrics()
         metrics["skipped"] = False
         metrics["local_visibility_retried"] = False
         return PhaseResult(phase=PHASE_NAME, status="needs_review", metrics=metrics, notes=notes, failures=failures)
+
+    # Many real avatars simply have no separate eyeball parts (or p2 legitimately
+    # found none, e.g. after the head-z-band gating fix). That is not a pipeline
+    # failure -- blocking the whole run on it would be wrong. Skip cleanly
+    # instead of needs_review; see CLAUDE.md task notes / ARCHITECTURE.md.
+    missing_roles = [r for r in ("eye_l", "eye_r") if r not in ctx.names]
+    if missing_roles:
+        metrics = _empty_metrics()
+        metrics["skipped"] = True
+        notes.append(
+            f"eyes enabled but no eye pair classified by p2 (missing role(s) "
+            f"{missing_roles}); phase skipped -- not treated as a failure"
+        )
+        return PhaseResult(phase=PHASE_NAME, status="ok", metrics=metrics, notes=notes)
 
     body = ctx.obj("body")
     bpy.context.view_layer.update()
@@ -108,6 +117,59 @@ def run(ctx, cfg: dict) -> PhaseResult:
         f"to body bbox center (avg_eye_y={avg_eye_y:.4f}, "
         f"body_center_y={body_center_y:.4f}) -> front_sign={front_sign}"
     )
+
+    # --- defense-in-depth: sanity-check fresh eyeball centers against the
+    # body's head z-band before carving anything. This is the same class of
+    # bug p2's head-z-band gate fixes (a mirrored non-eye pair misclassified
+    # as eyes) -- if it ever recurs, refuse to carve rather than cutting
+    # holes in the wrong place.
+    body_height = bbox["max"].z - bbox["min"].z
+
+    def _zfrac(z: float) -> float | None:
+        return (z - bbox["min"].z) / body_height if body_height > 0 else None
+
+    head_band = geom.head_z_band(geom.body_xz_points(body))
+    if head_band is None:
+        notes.append(
+            "eye sanity check: geom.head_z_band returned None (degenerate/no "
+            "band found) -- skipping the pre-carve head-band sanity check"
+        )
+    else:
+        band_lo, band_hi = head_band
+        margin = 0.10 * max(band_hi - band_lo, 1e-9)
+        bad = []
+        for role, info in (("eye_l", eye_l_info), ("eye_r", eye_r_info)):
+            z = info["center"].z
+            if not (band_lo - margin <= z <= band_hi + margin):
+                bad.append((role, z, _zfrac(z)))
+        if bad:
+            detail = ", ".join(
+                f"{r} z={z:.4f} (zfrac={('n/a' if zf is None else f'{zf:.3f}')})"
+                for r, z, zf in bad
+            )
+            notes.append(
+                f"eye sanity check FAILED: measured eyeball center(s) fall outside "
+                f"the body head z-band [{band_lo:.4f},{band_hi:.4f}] (margin={margin:.4f}) "
+                f"-- {detail}"
+            )
+            metrics = _empty_metrics()
+            metrics["skipped"] = False
+            metrics["local_visibility_retried"] = False
+            return PhaseResult(
+                phase=PHASE_NAME,
+                status="needs_review",
+                metrics=metrics,
+                notes=notes,
+                failures=[
+                    "p6_eyes: fresh eyeball center(s) outside the body head z-band "
+                    f"(defense-in-depth against p2 misclassification) -- {detail}; "
+                    "refusing to carve"
+                ],
+            )
+        notes.append(
+            f"eye sanity check passed: eye centers within head z-band "
+            f"[{band_lo:.4f},{band_hi:.4f}] (margin={margin:.4f})"
+        )
 
     # --- carve almond openings (fresh BVH rebuilt after each cut) ---
     bvh = _world_bvh(body)

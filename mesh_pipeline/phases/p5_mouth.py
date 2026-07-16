@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 
+from mesh_pipeline import geom
 from mesh_pipeline.context import PhaseResult
 from mesh_pipeline.geom import DisjointSet
 
@@ -271,8 +272,16 @@ def _find_lip_line(body_obj, bbox: dict, notes: list):
     """Detect the lip line: boundary/sharp-crease edges in the front mouth region.
 
     Heuristic (documented per task spec):
-    1. "Head z-band" = top 30% of the body's world bbox height, excluding the
-       very top 2% (scalp/hair) -- mouths sit in the lower part of the head.
+    1. "Head z-band" = geom.head_z_band(body world verts), which finds the
+       contiguous top z-slices before the body's x-width profile "explodes"
+       into shoulders/arms (see its docstring for the avatar_003 calibration
+       numbers). This replaces a fixed "top 30% of bbox height" rule, which
+       was too permissive: on avatar_003 that rule's z-band reached down
+       into the neck/upper chest and let a necklace pendant's crease (zfrac
+       0.82) get misdetected as the lip line. The top 2% of the resulting
+       band is still excluded (scalp/hair). Falls back to the fixed top-30%
+       rule, with a note, if geom.head_z_band returns None (degenerate
+       geometry / no band found).
     2. Front axis: within that z-band, compute the median |y| ("head radius")
        and compare how far the extreme +Y vertex and extreme -Y vertex
        protrude past it. AI-generated heads typically model a distinct nose
@@ -300,8 +309,22 @@ def _find_lip_line(body_obj, bbox: dict, notes: list):
 
         zmin, zmax = bbox["min"].z, bbox["max"].z
         height = zmax - zmin
-        head_lo = zmax - 0.30 * height
-        head_hi = zmax - 0.02 * height
+        head_band = geom.head_z_band(geom.body_xz_points(body_obj))
+        if head_band is not None:
+            band_lo, band_hi = head_band
+            head_lo = band_lo
+            head_hi = min(band_hi, zmax - 0.02 * height)  # still exclude scalp/hair tip
+            notes.append(
+                f"head z-band (geom.head_z_band): [{head_lo:.4f},{head_hi:.4f}]"
+            )
+        else:
+            head_lo = zmax - 0.30 * height
+            head_hi = zmax - 0.02 * height
+            notes.append(
+                "geom.head_z_band returned None (degenerate/no band found); "
+                "falling back to fixed top-30% head z-band rule "
+                f"[{head_lo:.4f},{head_hi:.4f}]"
+            )
 
         # x-centrality constraint: the mouth sits on the sagittal plane. In a
         # T-pose the wrists/hands are at the SAME height as the chin, and a

@@ -135,5 +135,11 @@ possible so unit tests can run without Blender:
 - `connected_components(bm)` -> list of vert-index sets
 - `uv_island_count(me)` union-find (from docs snippets)
 - `boundary_loop_histogram(bm)` union-find over boundary edges
+- `head_z_band(xz_points)` -> `(z_lo, z_hi) | None`, pure python: finds the head's
+  z-range from a body's world (x, z) vertex scatter by slicing z into ~60 buckets
+  and locating where the x-width profile "explodes" into shoulders/arms; used by
+  p2 (eye-pair gating), p5 (lip-line search band), p6 (post-carve sanity check)
+- `body_xz_points(obj, max_samples=4000)` -> subsampled world (x, z) vertex list,
+  the shared input to `head_z_band` for all three callers above
 - axis-label segmentation + region absorption helpers (pure logic on adjacency
   graphs, taking plain data structures, so they are testable without bpy)

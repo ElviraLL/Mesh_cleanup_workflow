@@ -258,6 +258,30 @@ def _classify_parts(part_names: list[str]) -> tuple[dict[str, str], list[str]]:
     body_center = body_info["bbox"]["center"]
     body_verts = max(body_info["verts"], 1)
 
+    # -- head z-band: eye candidates must sit on the HEAD, not merely above
+    # body-bbox-center. A body-center-only rule misclassifies anything above
+    # the torso midline as "eye-height" -- on avatar_003 this caught a
+    # mirrored necklace bead pair at zfrac 0.55 as eye_l/eye_r. Compute the
+    # band from the body's own world verts (subsampled) via the shared
+    # geom.head_z_band heuristic (see its docstring for the avatar_003
+    # calibration numbers); fall back to the old body-center rule, with an
+    # honest note, when no sane band can be found.
+    body_obj_for_band = bpy.data.objects[body_info["name"]]
+    xz_points = geom.body_xz_points(body_obj_for_band)
+    head_band = geom.head_z_band(xz_points)
+    if head_band is not None:
+        band_lo, band_hi = head_band
+        notes.append(
+            f"classify: head z-band (geom.head_z_band) = [{band_lo:.4f},{band_hi:.4f}]; "
+            "eye-pair candidates must have both centers inside this band"
+        )
+    else:
+        band_lo = band_hi = None
+        notes.append(
+            "classify: geom.head_z_band returned None (degenerate/no band found); "
+            "falling back to body-bbox-center-only rule for eye-pair upper_ok check"
+        )
+
     # -- eye pair: symmetric small pair near top-front of the body bbox -----
     eye_pair: tuple[dict, dict] | None = None
     for i in range(len(rest)):
@@ -276,7 +300,10 @@ def _classify_parts(part_names: list[str]) -> tuple[dict[str, str], list[str]]:
             ax, _ay, az = a["bbox"]["center"]
             bx, _by, bz = b["bbox"]["center"]
             mirror_ok = abs(ax + bx) < _EYE_MIRROR_TOLERANCE * max(abs(ax), abs(bx), 1e-6)
-            upper_ok = az > body_center[2] and bz > body_center[2]
+            if band_lo is not None:
+                upper_ok = band_lo <= az <= band_hi and band_lo <= bz <= band_hi
+            else:
+                upper_ok = az > body_center[2] and bz > body_center[2]
             if mirror_ok and upper_ok:
                 eye_pair = (a, b)
                 break
@@ -296,7 +323,14 @@ def _classify_parts(part_names: list[str]) -> tuple[dict[str, str], list[str]]:
             f"classify: eye pair found -> eye_l='{eye_l['name']}' eye_r='{eye_r['name']}'"
         )
     else:
-        notes.append("classify: no symmetric small top-front pair found (no eyes classified)")
+        band_desc = (
+            f"head z-band [{band_lo:.4f},{band_hi:.4f}]" if band_lo is not None
+            else "body-bbox-center fallback rule"
+        )
+        notes.append(
+            "classify: no symmetric small pair found inside the "
+            f"{band_desc} (no eyes classified)"
+        )
 
     # -- teeth: wide, flat, low-in-bbox stack --------------------------------
     for p in rest:
