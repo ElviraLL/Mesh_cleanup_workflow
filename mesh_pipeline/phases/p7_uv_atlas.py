@@ -85,6 +85,17 @@ _CONFETTI_RATIO = 0.9
 # inside larger islands -- see _dirty_face_indices).
 _SLIVER_ISLAND_FACES = 4
 
+# ...and independently of face count, islands whose total UV area is below
+# this are re-unwrapped too. The p5/p6 boolean cuts fragment skin faces into
+# small islands that inherit interpolated parent UVs: they can have >= 4
+# faces but near-zero UV area, sit INSIDE their parent island's UV space,
+# and pack_islands cannot scale/separate them (observed on avatar_003:
+# 13 confirmed overlaps, all such fragments; larger pack margins made it
+# WORSE because everything else rescaled around the stuck fragments).
+# A legitimate 4-face island on an ~8k-face mesh occupies ~5e-4 of UV space;
+# 1e-5 is safely below that.
+_SLIVER_UV_AREA = 1e-5
+
 _AXES: list[tuple[float, float, float]] = [
     (1.0, 0.0, 0.0),
     (-1.0, 0.0, 0.0),
@@ -130,29 +141,36 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
     # moves/scales *every* island") and silently break those textures, while
     # buying nothing -- only the body is baked into the atlas in p8. So the
     # shared 0-1 space is scoped to the body object alone.
+    if dirty_indices:
+        repaired = _repair_pathological_uv_faces(ctx.obj("body"), dirty_indices)
+        if repaired:
+            notes.append(
+                f"UV repair: {repaired} re-unwrapped face(s) had pathological UVs "
+                "(atlas-spanning slivers / extreme UV-to-3D area ratio from a "
+                "partially-failed unwrap); re-projected them as tiny standalone "
+                "islands so packing can place them"
+            )
+
     deliverable_names = [body_name]
     _ensure_uv_layer_named(deliverable_names, UV_LAYER_NAME)
-    _pack_islands_multi_object(deliverable_names, body_name)
+    island_overlap_count, candidate_pair_count = _pack_until_no_overlap(
+        deliverable_names, body_name, notes
+    )
     notes.append(
         f"packed islands for body only (active={body_name!r}); non-body "
         "deliverables keep their own UVs/textures (parented-not-joined design)"
     )
 
-    # -- (7) islands after + overlap check -----------------------------------
+    # -- (7) islands after ----------------------------------------------------
     body_after = ctx.obj("body")
     uv_islands_after = geom.uv_island_count(body_after.data)
     faces_total = len(body_after.data.polygons)
     faces_reunwrapped = len(dirty_indices)
 
-    all_islands: list[dict] = []
     per_object_islands: dict[str, int] = {}
     for name in deliverable_names:
         obj = bpy.data.objects[name]
-        islands = _uv_island_data(obj.data)
-        per_object_islands[name] = len(islands)
-        all_islands.extend(islands)
-
-    island_overlap_count, candidate_pair_count = _count_island_overlaps(all_islands)
+        per_object_islands[name] = len(_uv_island_data(obj.data))
 
     notes.append(f"uv_islands_after (body, {body_name!r}) = {uv_islands_after}")
     notes.append(
@@ -291,11 +309,18 @@ def _dirty_face_indices(
             dirty.extend(face_idxs)
             continue
         # Within a kept-clean slot, sliver islands (< _SLIVER_ISLAND_FACES
-        # faces) are re-unwrapped anyway: they're broken remnants of the soup
-        # layout, not preserved artistry. pack_islands cannot place them
-        # meaningfully and stacks them inside larger islands (avatar_003
-        # calibration: 5 genuine post-pack overlaps, all 1-2-face slivers).
-        sliver_faces = [fi for g in groups if len(g) < _SLIVER_ISLAND_FACES for fi in g]
+        # faces, OR near-zero UV area regardless of face count) are
+        # re-unwrapped anyway: they're broken remnants of the soup layout or
+        # boolean-cut fragments, not preserved artistry. pack_islands cannot
+        # place them meaningfully and stacks them inside larger islands
+        # (avatar_003 calibration: 5 post-pack overlaps from 1-2-face slivers,
+        # then 13 more from >=4-face near-zero-area boolean fragments).
+        sliver_faces = [
+            fi
+            for g in groups
+            if len(g) < _SLIVER_ISLAND_FACES or _island_uv_area(bm, uvl, g) < _SLIVER_UV_AREA
+            for fi in g
+        ]
         if sliver_faces:
             notes.append(
                 f"dirty-face decision: material_index={mat_idx}: "
@@ -304,6 +329,101 @@ def _dirty_face_indices(
             )
             dirty.extend(sliver_faces)
     return dirty
+
+
+def _repair_pathological_uv_faces(body, dirty_indices: list[int]) -> int:
+    """Re-project freshly-unwrapped faces whose UVs came out pathological.
+
+    ANGLE_BASED unwrap on messy boolean-created regions can partially fail,
+    leaving a few faces with atlas-spanning sliver UVs (observed on
+    avatar_003: one 78-triangle cavity island whose garbage triangles covered
+    ~0.3x0.3 of UV space and 'overlapped' a dozen unrelated islands; pack
+    cannot repair intra-island garbage). Detection: a face's UV-to-3D area
+    ratio wildly above the median of its batch, or a UV bbox diagonal that
+    spans a large fraction of the atlas. Repair: give each such face its own
+    tiny planar-projected island (dominant-normal-axis projection scaled to
+    ~2mm of UV space); the subsequent pack places them like any other island.
+    These are cavity/fragment faces -- placement quality is secondary to not
+    poisoning the atlas.
+    """
+    import bmesh
+
+    me = body.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    try:
+        bm.faces.ensure_lookup_table()
+        uvl = bm.loops.layers.uv.active
+        if uvl is None:
+            return 0
+
+        ratios: list[tuple[int, float, float]] = []  # (face_idx, ratio, uv_diag)
+        for fi in dirty_indices:
+            f = bm.faces[fi]
+            area3d = f.calc_area()
+            uv_area = _island_uv_area(bm, uvl, [fi])
+            us = [l[uvl].uv.x for l in f.loops]
+            vs = [l[uvl].uv.y for l in f.loops]
+            diag = ((max(us) - min(us)) ** 2 + (max(vs) - min(vs)) ** 2) ** 0.5
+            ratio = uv_area / max(area3d, 1e-12)
+            ratios.append((fi, ratio, diag))
+
+        finite = sorted(r for _, r, _ in ratios if r > 0)
+        if not finite:
+            return 0
+        median_ratio = finite[len(finite) // 2]
+
+        bad = [
+            (fi, diag)
+            for fi, ratio, diag in ratios
+            if diag > 0.3 or (median_ratio > 0 and ratio > 50 * median_ratio)
+        ]
+        if not bad:
+            return 0
+
+        for n, (fi, _diag) in enumerate(bad):
+            f = bm.faces[fi]
+            nx, ny, nz = abs(f.normal.x), abs(f.normal.y), abs(f.normal.z)
+            if nx >= ny and nx >= nz:
+                axes = (1, 2)  # project onto YZ
+            elif ny >= nx and ny >= nz:
+                axes = (0, 2)  # XZ
+            else:
+                axes = (0, 1)  # XY
+            coords = [(v.co[axes[0]], v.co[axes[1]]) for v in f.verts]
+            min0 = min(c[0] for c in coords)
+            min1 = min(c[1] for c in coords)
+            extent = max(
+                max(c[0] for c in coords) - min0,
+                max(c[1] for c in coords) - min1,
+                1e-9,
+            )
+            scale = 0.002 / extent
+            for loop in f.loops:
+                c0 = loop.vert.co[axes[0]]
+                c1 = loop.vert.co[axes[1]]
+                loop[uvl].uv = ((c0 - min0) * scale, (c1 - min1) * scale)
+
+        bm.to_mesh(me)
+        me.update()
+        return len(bad)
+    finally:
+        bm.free()
+
+
+def _island_uv_area(bm, uvl, face_idxs: list[int]) -> float:
+    """Total UV-space area of the given faces (fan triangulation per face)."""
+    total = 0.0
+    for fi in face_idxs:
+        loops = bm.faces[fi].loops
+        if len(loops) < 3:
+            continue
+        u0 = loops[0][uvl].uv
+        for i in range(1, len(loops) - 1):
+            u1 = loops[i][uvl].uv
+            u2 = loops[i + 1][uvl].uv
+            total += abs((u1 - u0).cross(u2 - u0)) * 0.5
+    return total
 
 
 def _island_groups_subset(bm, uvl, face_idxs: list[int]) -> list[list[int]]:
@@ -383,7 +503,10 @@ def _ensure_uv_layer_named(object_names: list[str], layer_name: str) -> None:
             me.uv_layers.active = active
 
 
-def _pack_islands_multi_object(object_names: list[str], active_name: str) -> None:
+_PACK_MARGIN_LADDER = (0.004, 0.008, 0.012, 0.016)
+
+
+def _pack_islands_multi_object(object_names: list[str], active_name: str, margin: float = 0.004) -> None:
     bpy.ops.object.select_all(action="DESELECT")
     for name in object_names:
         bpy.data.objects[name].select_set(True)
@@ -403,11 +526,47 @@ def _pack_islands_multi_object(object_names: list[str], active_name: str) -> Non
         bmesh.update_edit_mesh(obj.data)
 
     try:
-        bpy.ops.uv.pack_islands(rotate=True, margin=0.004)
+        bpy.ops.uv.pack_islands(rotate=True, margin=margin)
     except TypeError:
-        bpy.ops.uv.pack_islands(margin=0.004)  # older API without `rotate`
+        bpy.ops.uv.pack_islands(margin=margin)  # older API without `rotate`
 
     bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def _pack_until_no_overlap(
+    object_names: list[str], active_name: str, notes: list[str]
+) -> tuple[int, int]:
+    """Pack, verify with the exact overlap test, and re-pack up a margin
+    ladder until overlap-free (or the ladder is exhausted).
+
+    Blender's pack_islands occasionally leaves genuinely overlapping islands
+    (observed repeatedly on real avatars: counts of 1-5 that vary between
+    otherwise-identical runs). A slightly larger margin reliably gives the
+    packer room to separate them; this loop makes that automatic instead of
+    relying on external retries.
+
+    Returns (island_overlap_count, candidate_pair_count) from the final pack.
+    """
+    overlap_count = 0
+    candidates = 0
+    for i, margin in enumerate(_PACK_MARGIN_LADDER):
+        _pack_islands_multi_object(object_names, active_name, margin=margin)
+        all_islands: list[dict] = []
+        for name in object_names:
+            all_islands.extend(_uv_island_data(bpy.data.objects[name].data))
+        overlap_count, candidates = _count_island_overlaps(all_islands)
+        if overlap_count == 0:
+            if i > 0:
+                notes.append(
+                    f"pack retry ladder: overlap-free at margin={margin} "
+                    f"(attempt {i + 1}/{len(_PACK_MARGIN_LADDER)})"
+                )
+            return overlap_count, candidates
+        notes.append(
+            f"pack attempt {i + 1}/{len(_PACK_MARGIN_LADDER)} (margin={margin}): "
+            f"{overlap_count} confirmed overlap(s); retrying with a larger margin"
+        )
+    return overlap_count, candidates
 
 
 # ---------------------------------------------------------------------------

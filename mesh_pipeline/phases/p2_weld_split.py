@@ -332,15 +332,26 @@ def _classify_parts(part_names: list[str]) -> tuple[dict[str, str], list[str]]:
             f"{band_desc} (no eyes classified)"
         )
 
-    # -- teeth: wide, flat, low-in-bbox stack --------------------------------
+    # -- teeth: wide, flat stack sitting on the HEAD, not merely low-in-bbox.
+    # A "cz < body_center[2]" (LOW in bbox) rule was the original heuristic,
+    # but real teeth sit inside the head near the mouth, not necessarily in
+    # the lower half of the whole body -- on avatar_003 (bbox center
+    # z=-0.027) that rule misclassified a hip-level part as 'teeth' simply
+    # because it happened to be wide/flat and below the body's vertical
+    # midpoint. Gate on the same head z-band used for eye-pair classification
+    # instead (falls back to the old body-center rule, inverted to require
+    # ABOVE center like the eye fallback, when no band was found).
     for p in rest:
         if p["name"] in used:
             continue
         dx, _dy, dz = p["bbox"]["dims"]
         cz = p["bbox"]["center"][2]
         wide_flat = dx > _TEETH_WIDTH_TO_HEIGHT_RATIO * max(dz, 1e-6)
-        lower_ok = cz < body_center[2]
-        if wide_flat and lower_ok:
+        if band_lo is not None:
+            in_head_band = band_lo <= cz <= band_hi
+        else:
+            in_head_band = cz > body_center[2]
+        if wide_flat and in_head_band:
             roles["teeth"] = p["name"]
             used.add(p["name"])
             notes.append(f"classify: teeth -> '{p['name']}'")

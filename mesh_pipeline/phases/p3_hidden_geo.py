@@ -189,7 +189,14 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
         body_bbox_mouth = _world_bbox(body_obj)
         body_height_mouth = body_bbox_mouth["max"].z - body_bbox_mouth["min"].z
         if body_height_mouth > 0:
-            lip = geom.find_lip_line(body_obj, body_bbox_mouth, notes)
+            eye_centroid = geom.eyes_world_centroid(ctx)
+            lip = geom.find_lip_line(
+                body_obj,
+                body_bbox_mouth,
+                notes,
+                known_front_sign=geom.front_sign_from_eyes(ctx, body_bbox_mouth),
+                eye_z=(eye_centroid.z if eye_centroid is not None else None),
+            )
             if lip is not None:
                 fissure_z, mouth_x, front_sign, lip_surface_y = lip
                 x_half = _MOUTH_PROTECT_X_HALF_FRAC * body_height_mouth

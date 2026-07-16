@@ -98,6 +98,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # p4 assertion: max boundary edges tolerated in body+legs z-bands
         # (tiny unfillable slit fragments are normal on real AI meshes)
         "max_body_boundary_edges": 20,
+        # p7 assertion: confirmed UV island overlaps tolerated after pack
+        # (0 = strict; real scans may need a small tolerance -- see assertions._p7)
+        "max_uv_overlaps": 0,
     },
 }
 
@@ -271,6 +274,10 @@ def _validate(cfg: dict[str, Any]) -> list[str]:
     check(
         isinstance(qa["max_body_boundary_edges"], int) and qa["max_body_boundary_edges"] >= 0,
         "qa.max_body_boundary_edges must be a non-negative int",
+    )
+    check(
+        isinstance(qa["max_uv_overlaps"], int) and qa["max_uv_overlaps"] >= 0,
+        "qa.max_uv_overlaps must be a non-negative int",
     )
 
     return errors

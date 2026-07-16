@@ -211,7 +211,56 @@ def body_xz_points(obj, max_samples: int = 4000) -> list[tuple[float, float]]:
     return pts
 
 
-def find_lip_line(body_obj, bbox: dict, notes: list):
+def eyes_world_centroid(ctx):
+    """World-space centroid of the classified eyeballs, or None.
+
+    Shared anatomical anchor: front_sign_from_eyes uses its Y, and the
+    lip-line search uses its Z (the mouth sits a predictable fraction of the
+    eye-to-chin distance below the eyes).
+    """
+    import bpy
+    from mathutils import Vector
+
+    names = getattr(ctx, "names", {})
+    eye_names = [names.get("eye_l"), names.get("eye_r")]
+    if not all(n and n in bpy.data.objects for n in eye_names):
+        return None
+    bpy.context.view_layer.update()
+    total = Vector((0.0, 0.0, 0.0))
+    count = 0
+    for n in eye_names:
+        obj = bpy.data.objects[n]
+        mw = obj.matrix_world
+        for v in obj.data.vertices:
+            total += mw @ v.co
+            count += 1
+    if count == 0:
+        return None
+    return total / count
+
+
+def front_sign_from_eyes(ctx, body_bbox: dict) -> int | None:
+    """Face side (+1/-1 along Y) from the classified eyeballs, or None.
+
+    Eyes sit on the front of the face by definition, so when p2 classified an
+    eye pair this beats any protrusion heuristic (long hair out-protrudes the
+    nose on real characters). Uses world-space vertex centroids of both eye
+    objects vs the body bbox center.
+    """
+    centroid = eyes_world_centroid(ctx)
+    if centroid is None:
+        return None
+    center_y = (body_bbox["min"].y + body_bbox["max"].y) / 2.0
+    return 1 if centroid.y >= center_y else -1
+
+
+def find_lip_line(
+    body_obj,
+    bbox: dict,
+    notes: list,
+    known_front_sign: int | None = None,
+    eye_z: float | None = None,
+):
     """Detect the lip line: boundary/sharp-crease edges in the front mouth region.
 
     Shared by p5_mouth (lip-line search for the closed-lips mouth-bag cutter)
@@ -275,6 +324,28 @@ def find_lip_line(body_obj, bbox: dict, notes: list):
                 f"[{head_lo:.4f},{head_hi:.4f}]"
             )
 
+        # Eye-anchored mouth window: anthropometrically the mouth fissure sits
+        # roughly 45-85% of the eye-to-chin distance below the eyes. Without
+        # this, the nose-base crease wins over the true lip crease (avatar_003:
+        # detected z=0.414 = nose base, real mouth ~0.388; eyes z=0.431,
+        # chin=band_lo=0.366 -> window [0.376, 0.402]).
+        if eye_z is not None and eye_z > head_lo:
+            eye_to_chin = eye_z - head_lo
+            window_hi = eye_z - 0.45 * eye_to_chin
+            window_lo = eye_z - 0.85 * eye_to_chin
+            new_lo = max(head_lo, window_lo)
+            new_hi = min(head_hi, window_hi)
+            if new_hi > new_lo:
+                head_lo, head_hi = new_lo, new_hi
+                notes.append(
+                    f"eye-anchored mouth z-window applied: [{head_lo:.4f},{head_hi:.4f}] "
+                    f"(eye_z={eye_z:.4f}, 45-85% of eye-to-chin below the eyes)"
+                )
+            else:
+                notes.append(
+                    "eye-anchored mouth z-window degenerate; keeping head band as-is"
+                )
+
         # x-centrality constraint: the mouth sits on the sagittal plane. In a
         # T-pose the wrists/hands are at the SAME height as the chin, and a
         # glove seam there is exactly the kind of sharp-edge cluster the
@@ -288,53 +359,115 @@ def find_lip_line(body_obj, bbox: dict, notes: list):
         def _central(wco) -> bool:
             return abs(wco.x - x_center) <= x_half_limit
 
-        # front-axis heuristic
-        band_ys = []
-        for v in bm.verts:
-            wco = mat @ v.co
-            if head_lo <= wco.z <= head_hi and _central(wco):
-                band_ys.append(wco.y)
-        if not band_ys:
-            notes.append("lip detection: no vertices found in the candidate head z-band")
-            return None
-        band_ys_sorted = sorted(abs(y) for y in band_ys)
-        median_y_abs = band_ys_sorted[len(band_ys_sorted) // 2]
-        y_max = max(band_ys)
-        y_min = min(band_ys)
-        protrusion_pos = y_max - median_y_abs
-        protrusion_neg = (-y_min) - median_y_abs
-        front_sign = 1 if protrusion_pos >= protrusion_neg else -1
-        notes.append(
-            "front-axis heuristic (mouth): within head z-band "
-            f"[{head_lo:.4f},{head_hi:.4f}], compared how far the extreme +Y "
-            f"({protrusion_pos:.4f} past median|y|={median_y_abs:.4f}) and -Y "
-            f"({protrusion_neg:.4f} past median) vertices protrude (nose-bump "
-            f"asymmetry) -> front_sign={front_sign}"
-        )
+        # front-axis: prefer the caller-provided sign (derived from classified
+        # eyeballs, which sit on the face side by definition -- see
+        # front_sign_from_eyes). The nose-protrusion fallback below FAILS on
+        # long-haired characters: avatar_003's back-of-head hair bulge
+        # (0.0527) out-protrudes the nose (0.0408), which sent the mouth
+        # carve into the back of the head. Only trust protrusion when there
+        # is no eye-derived sign.
+        if known_front_sign in (1, -1):
+            front_sign = known_front_sign
+            notes.append(
+                f"front-axis (mouth): using caller-provided front_sign={front_sign} "
+                "(derived from classified eyeballs; protrusion heuristic skipped)"
+            )
+        else:
+            band_ys = []
+            for v in bm.verts:
+                wco = mat @ v.co
+                if head_lo <= wco.z <= head_hi and _central(wco):
+                    band_ys.append(wco.y)
+            if not band_ys:
+                notes.append("lip detection: no vertices found in the candidate head z-band")
+                return None
+            band_ys_sorted = sorted(abs(y) for y in band_ys)
+            median_y_abs = band_ys_sorted[len(band_ys_sorted) // 2]
+            y_max = max(band_ys)
+            y_min = min(band_ys)
+            protrusion_pos = y_max - median_y_abs
+            protrusion_neg = (-y_min) - median_y_abs
+            front_sign = 1 if protrusion_pos >= protrusion_neg else -1
+            notes.append(
+                "front-axis heuristic (mouth): within head z-band "
+                f"[{head_lo:.4f},{head_hi:.4f}], compared how far the extreme +Y "
+                f"({protrusion_pos:.4f} past median|y|={median_y_abs:.4f}) and -Y "
+                f"({protrusion_neg:.4f} past median) vertices protrude (nose-bump "
+                "asymmetry) -> front_sign="
+                f"{front_sign} (CAUTION: hair bulges can beat the nose; "
+                "eye-derived sign is preferred when available)"
+            )
 
-        candidates = []
-        for e in bm.edges:
-            v0, v1 = e.verts
-            w0 = mat @ v0.co
-            w1 = mat @ v1.co
-            mid_z = (w0.z + w1.z) / 2.0
-            mid_y = (w0.y + w1.y) / 2.0
-            if not (head_lo <= mid_z <= head_hi):
-                continue
-            if front_sign * mid_y <= 0:
-                continue
-            mid = (w0 + w1) / 2.0
-            if not _central(mid):
-                continue
-            is_boundary = e.is_boundary
-            is_sharp = not e.smooth
-            is_crease = False
-            if len(e.link_faces) == 2:
-                is_crease = e.calc_face_angle() > math.radians(35)
-            if is_boundary or is_sharp or is_crease:
-                candidates.append(e)
+        def _collect(crease_deg: float) -> list:
+            found = []
+            threshold = math.radians(crease_deg)
+            for e in bm.edges:
+                v0, v1 = e.verts
+                w0 = mat @ v0.co
+                w1 = mat @ v1.co
+                mid_z = (w0.z + w1.z) / 2.0
+                mid_y = (w0.y + w1.y) / 2.0
+                if not (head_lo <= mid_z <= head_hi):
+                    continue
+                if front_sign * mid_y <= 0:
+                    continue
+                mid = (w0 + w1) / 2.0
+                if not _central(mid):
+                    continue
+                is_boundary = e.is_boundary
+                is_sharp = not e.smooth
+                is_crease = False
+                if len(e.link_faces) == 2:
+                    is_crease = e.calc_face_angle() > threshold
+                if is_boundary or is_sharp or is_crease:
+                    found.append(e)
+            return found
+
+        # Detection ladder: crisp creases first, then soft ones. Real sculpts
+        # often model closed lips as a shallow (<35 deg) crease.
+        candidates = _collect(35.0)
+        if not candidates:
+            candidates = _collect(22.0)
+            if candidates:
+                notes.append(
+                    "lip detection: no >35deg creases; found candidates at the "
+                    "relaxed 22deg threshold"
+                )
+
+        def _synthesize():
+            """Anthropometric fallback: eye-anchored window midpoint + surface probe.
+
+            Only available when eye_z was provided (the window is then narrow
+            and reliable). Honest degradation for smooth-lipped sculpts with
+            no detectable crease cluster.
+            """
+            if eye_z is None:
+                return None
+            fissure_z = (head_lo + head_hi) / 2.0
+            central_front_ys = [
+                (mat @ v.co).y
+                for v in bm.verts
+                if abs((mat @ v.co).z - fissure_z) <= 0.02 * height
+                and _central(mat @ v.co)
+                and front_sign * (mat @ v.co).y > 0
+            ]
+            if not central_front_ys:
+                return None
+            lip_surface_y = (
+                max(central_front_ys) if front_sign > 0 else min(central_front_ys)
+            )
+            notes.append(
+                "lip detection: no usable crease cluster; SYNTHESIZED lip line "
+                f"from eye anatomy: fissure_z={fissure_z:.4f} (window midpoint), "
+                f"mouth_x={x_center:.4f}, lip_surface_y={lip_surface_y:.4f} "
+                "(front-surface probe)"
+            )
+            return (fissure_z, x_center, front_sign, lip_surface_y)
 
         if not candidates:
+            synthesized = _synthesize()
+            if synthesized is not None:
+                return synthesized
             notes.append(
                 "lip detection: no boundary/sharp/crease edges found on the front "
                 "side of the head z-band"
@@ -378,6 +511,9 @@ def find_lip_line(body_obj, bbox: dict, notes: list):
                 "lip detection: front-side candidate edges did not form a "
                 "wide-x/thin-z (lip-like) cluster"
             )
+            synthesized = _synthesize()
+            if synthesized is not None:
+                return synthesized
             return None
 
         xs = [p.x for p in best_verts_world]

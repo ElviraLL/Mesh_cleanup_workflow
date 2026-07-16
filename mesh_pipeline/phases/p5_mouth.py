@@ -1,16 +1,47 @@
 """Phase 5 -- closed-lips mouth bag.
 
-One boolean does both jobs: a DIFFERENCE with a "closed-lips bag" cutter
-pushed through the lip line splits the lips AND creates the cavity walls
-(cutter faces inherit the cutter's material, so we assign a dark
-"Mouth_Interior" material to the cutter before the boolean). The cutter is a
-scaled uvsphere whose FRONT half (toward the lip surface) is tapered, via a
-per-vertex z-ramp, down to a thin horizontal slit (cfg mouth.lip_gap_mm) --
-this is what makes the carved lips read as CLOSED (touching) at the skin
-surface while still being topologically split into independent upper/lower
-lip rims a rig can pull apart later. The BACK half of the cutter (inside the
-head) keeps its full interior "bag" height (cfg mouth.bag_height), which is
-where teeth + tongue actually live.
+Two separate steps now do the two jobs that a single tapered-slit boolean
+used to try to do at once (see "Design history" below for why that was
+abandoned):
+
+  1. A plain, roomy ellipsoid cutter (cfg mouth.cutter_radii for rx/ry, cfg
+     mouth.bag_height for rz) is DIFFERENCE-booleaned through the lip line.
+     This is the same "fat" cutter shape proven clean on real AI-generated
+     meshes: one continuous rim loop, no fragmentation, regardless of local
+     triangle size. Cutter faces inherit a dark "Mouth_Interior" material
+     (assigned before the boolean) so the carved cavity walls -- and the rim
+     loop bordering them -- are trivially identifiable afterward. This step
+     produces an OPEN mouth (a real gap), not a closed one.
+  2. "Zip-close": every rim vertex (and, with decreasing strength, its
+     immediate neighborhood) is pulled in Z onto a thin band straddling the
+     detected lip-fissure plane (cfg mouth.lip_gap_mm), which is what makes
+     the opening read as CLOSED lips at the skin surface while remaining
+     topologically split into independent upper/lower rims a rig can pull
+     apart later. Only Z is touched -- X/Y (and therefore the boolean's own
+     proven-clean topology) are never altered, so this step cannot introduce
+     new fragmentation, only relocate vertices that already exist.
+
+A numeric "rim loop count" guard runs between steps 1 and 2 (see
+`_count_rim_loops`): a healthy single-pass cut produces exactly one
+continuous rim loop (occasionally two, tolerated); if the boolean somehow
+produced more, that is a sign of a bad cut and the phase stops before
+zip-close/inserts rather than papering over it.
+
+Design history (why not a tapered-slit cutter): an earlier version of this
+phase built the "closed" read directly into the cutter shape -- a per-vertex
+Z-taper on the cutter's front half squeezed it down to a razor-thin slit
+exactly where it crosses the skin. That worked on smooth synthetic geometry
+but SHREDDED real AI-generated meshes (avatar_003_body.glb): a slit an order
+of magnitude thinner than the local triangle size produced a degenerate
+boolean -- large torn fragments, teeth/tongue ending up visibly outside the
+skin -- while every existing numeric metric still passed (a "vertex squeeze
+safety net" clamped the resulting z-statistics without repairing the
+topology, masking the damage). The fat-ellipsoid-then-zip-close design
+separates "carve a clean opening" (now provably robust, since it is the
+exact cutter shape that was already verified clean) from "make the opening
+read as closed" (now a pure post-hoc vertex move, guarded by the rim-loop
+count and an outside-skin check on the inserts) so a fragile geometric trick
+can never again silently pass every metric while visually failing.
 
 Two placement modes:
 
@@ -65,6 +96,8 @@ def _empty_metrics() -> dict:
         "lip_gap_mm_measured": None,
         "teeth_reference_kept": None,
         "lips_topologically_split": None,
+        "rim_loop_count": None,
+        "inserts_outside_fraction": None,
     }
 
 
@@ -112,7 +145,15 @@ def run(ctx, cfg: dict) -> PhaseResult:
             failures=[f"p5_mouth: body world bbox has non-positive height ({body_height})"],
         )
 
-    lip = geom.find_lip_line(body, bbox, notes)
+    eye_sign = geom.front_sign_from_eyes(ctx, bbox)
+    eye_centroid = geom.eyes_world_centroid(ctx)
+    lip = geom.find_lip_line(
+        body,
+        bbox,
+        notes,
+        known_front_sign=eye_sign,
+        eye_z=(eye_centroid.z if eye_centroid is not None else None),
+    )
     if lip is None:
         metrics = _empty_metrics()
         metrics["skipped"] = False
@@ -170,14 +211,50 @@ def run(ctx, cfg: dict) -> PhaseResult:
             f"(encloses teeth bbox + {int((_REFERENCE_MARGIN - 1) * 100)}% margin)"
         )
 
+    rx, ry, rz = _cutter_dims(mouth_cfg, body_height, size_override)
+
+    # --- 1b. pre-boolean dedupe: remove any redundant inner surface layer
+    # inside the cutter's own footprint. Real AI-generated meshes (avatar_003
+    # calibration) can carry a pre-existing second mouth-interior surface a
+    # few mm to a couple cm behind the true skin -- a plain fat cutter
+    # (proven clean against a SINGLE-layer surface) carves through BOTH
+    # layers, producing multiple disconnected rim loops even though the
+    # cutter itself is not the problem. See `_dedupe_mouth_layers` docstring.
+    deduped = _dedupe_mouth_layers(body, mouth_x, fissure_z, front_sign, lip_surface_y, rx, ry, rz)
+    if deduped:
+        notes.append(
+            f"pre-boolean dedupe: removed {deduped} redundant inner-surface "
+            "face(s) inside the cutter footprint (see docstring; avoids the "
+            "cutter carving through a duplicate mouth-interior layer and "
+            "fragmenting the rim)"
+        )
+        body = ctx.obj("body")
+        bpy.context.view_layer.update()
+
     cutter_name = _make_mouth_cutter(
-        mouth_cfg, body_height, mouth_x, fissure_z, front_sign, lip_surface_y,
-        size_override=size_override, notes=notes,
+        mouth_x, fissure_z, front_sign, lip_surface_y, rx, ry, rz,
     )
 
     # --- 2. boolean DIFFERENCE (also splits the lips + tints cavity walls) ---
+    # The body shell is deliberately open (hollow interior, hair-card loops),
+    # and Blender's EXACT boolean silently degenerates on open operands: on
+    # avatar_003's face the DIFFERENCE embedded the cutter as a closed
+    # interior bubble with ZERO Mouth_Interior border edges -- no skin split
+    # at all. Temporarily cap every open boundary loop so the operand is
+    # watertight for the cut, then remove the caps.
+    body = ctx.obj("body")
+    caps = _temp_cap_all_boundaries(body)
+    if caps:
+        notes.append(
+            f"temp-capped open boundary loops with {caps} tagged fill face(s) "
+            "for a watertight boolean operand (removed after the cut)"
+        )
     body = ctx.obj("body")
     _boolean_difference(body, cutter_name)
+    body = ctx.obj("body")
+    removed_caps = _remove_temp_caps(body)
+    if caps or removed_caps:
+        notes.append(f"removed {removed_caps} temp cap face(s) after the boolean")
     body = ctx.obj("body")
     bpy.context.view_layer.update()
 
@@ -197,36 +274,12 @@ def run(ctx, cfg: dict) -> PhaseResult:
             failures=["p5_mouth: Mouth_Interior material missing after the boolean cut"],
         )
 
-    # Safety-net squeeze: on smooth synthetic geometry the tapered cutter
-    # alone produces a clean, uniformly thin slit (verified in tests/
-    # make_fixture.py's e2e fixture). Real AI-generated meshes are far less
-    # regular near the mouth -- verified directly on avatar_003: even with
-    # the body pre-subdivided to sub-mm resolution in the mouth region, the
-    # boolean still produced SEVERAL disconnected rim loops (not one
-    # continuous slit) spanning tens of mm in Z, because the cutter's
-    # razor-thin front cap does not reliably poke through an irregular real
-    # surface everywhere across the mouth width. Rather than chase a
-    # perfectly clean single-pass cut against arbitrary input meshes, pull
-    # every rim vertex's Z back to within target_half_gap of fissure_z after
-    # the fact -- this decouples "the cutter reliably carves an opening"
-    # (its job) from "the opening reads as closed" (guaranteed here,
-    # regardless of how irregular the raw cut came out).
-    lip_gap_units = mouth_cfg.get("lip_gap_mm", 0.4) * _MM
-    target_half_gap = lip_gap_units / 2.0
-    squeezed = _squeeze_slit_to_target(body, mat_idx, fissure_z, target_half_gap)
-    if squeezed:
-        notes.append(
-            f"slit squeeze: pulled {squeezed} rim vertex/vertices back to within "
-            f"{target_half_gap / _MM:.3f}mm of fissure_z (safety net for irregular "
-            "real-mesh cuts, see note above)"
-        )
-        body = ctx.obj("body")
-        bpy.context.view_layer.update()
-
+    # --- 3. measure the raw carved rim (before zip-close) ---
     opening = _measure_mouth_opening(body, mat_idx)
     if opening is None:
         metrics = _empty_metrics()
         metrics["skipped"] = False
+        metrics["mode"] = mode
         notes.append(
             "boolean cut applied but no Mouth_Interior-bordered rim edges were found "
             "afterward (cutter may not have intersected the skin surface); skipping "
@@ -243,12 +296,95 @@ def run(ctx, cfg: dict) -> PhaseResult:
     z_lo, z_hi = opening["z_range"]
     x_lo, x_hi = opening["x_range"]
     opening_height = max(z_hi - z_lo, 1e-6)
-    opening_width = max(x_hi - x_lo, 1e-6)
     rim_front_y = max(opening["y_values"]) if front_sign > 0 else min(opening["y_values"])
+    notes.append(
+        f"raw carved opening rim measured (pre zip-close): x=[{x_lo:.4f},{x_hi:.4f}] "
+        f"z=[{z_lo:.4f},{z_hi:.4f}] rim_front_y={rim_front_y:.4f}"
+    )
+
+    # --- 4. fragmentation guard: count connected rim loops BEFORE zip-close.
+    # A clean single-pass cut through the fat, roomy cutter produces exactly
+    # one continuous rim loop (occasionally two, tolerated); more than that
+    # means the boolean itself tore the mesh -- the failure mode a razor-thin
+    # cutter used to hide (see module docstring "Design history"). Stop here
+    # rather than zip-closing/placing inserts against known-bad topology.
+    rim_loop_count = _count_rim_loops(body, mat_idx)
+    notes.append(f"rim_loop_count={rim_loop_count} (measured before zip-close)")
+    if rim_loop_count > 2:
+        metrics = _empty_metrics()
+        metrics["skipped"] = False
+        metrics["mode"] = mode
+        metrics["opening_z_range"] = [z_lo, z_hi]
+        metrics["lip_gap_mm_measured"] = (z_hi - z_lo) / _MM
+        metrics["teeth_reference_kept"] = mode == "reference_kept"
+        metrics["lips_topologically_split"] = False
+        metrics["rim_loop_count"] = rim_loop_count
+        notes.append(
+            f"mouth carving produced a fragmented rim ({rim_loop_count} disconnected "
+            "loops, expected <= 2) -- the boolean cut tore the mesh rather than "
+            "cutting one clean opening; stopping before zip-close/teeth/tongue "
+            "placement rather than closing over damaged topology"
+        )
+        return PhaseResult(
+            phase=PHASE_NAME,
+            status="needs_review",
+            metrics=metrics,
+            notes=notes,
+            failures=[
+                f"p5_mouth: rim_loop_count={rim_loop_count} exceeds 2 -- boolean cut "
+                "fragmented the mouth opening rim instead of producing a single "
+                "continuous loop"
+            ],
+        )
+
+    # --- 5. zip-close: pull the rim (and a locality-guarded 1-ring falloff)
+    # onto a thin band straddling the fissure plane. Moves Z only -- the
+    # boolean's own (already-verified-clean) X/Y topology is never touched,
+    # so this step cannot introduce new fragmentation, only relocate
+    # vertices that already exist (delete-nothing invariant).
+    lip_gap_units = mouth_cfg.get("lip_gap_mm", 0.4) * _MM
+    rim_moved, neighbors_moved = _zip_close(
+        body, mat_idx, fissure_z, lip_gap_units, x_lo, x_hi, opening_height
+    )
+    notes.append(
+        f"zip-close: moved {rim_moved} rim vertex/vertices onto the fissure-plane "
+        f"band (half-gap={lip_gap_units / 2.0 / _MM:.3f}mm) and {neighbors_moved} "
+        "falloff neighbor vertex/vertices (skin-side 50%, cavity-side 30%, "
+        "locality-guarded)"
+    )
+    body = ctx.obj("body")
+    bpy.context.view_layer.update()
+
+    # --- 6. re-measure the rim after zip-close -- these are the metrics that
+    # describe the final (closed) state ---
+    opening_final = _measure_mouth_opening(body, mat_idx)
+    if opening_final is None:
+        metrics = _empty_metrics()
+        metrics["skipped"] = False
+        metrics["mode"] = mode
+        metrics["rim_loop_count"] = rim_loop_count
+        notes.append(
+            "zip-close ran but no Mouth_Interior-bordered rim edges were found "
+            "afterward (unexpected -- the pre-zip measurement found some); skipping "
+            "teeth/tongue placement"
+        )
+        return PhaseResult(
+            phase=PHASE_NAME,
+            status="needs_review",
+            metrics=metrics,
+            notes=notes,
+            failures=["p5_mouth: could not measure the opening rim after zip-close"],
+        )
+
+    z_lo, z_hi = opening_final["z_range"]
+    x_lo, x_hi = opening_final["x_range"]
+    opening_width = max(x_hi - x_lo, 1e-6)
+    rim_front_y = max(opening_final["y_values"]) if front_sign > 0 else min(opening_final["y_values"])
     lip_gap_mm_measured = (z_hi - z_lo) / _MM
     notes.append(
-        f"opening (slit) rim measured: x=[{x_lo:.4f},{x_hi:.4f}] z=[{z_lo:.4f},{z_hi:.4f}] "
-        f"rim_front_y={rim_front_y:.4f} lip_gap_mm_measured={lip_gap_mm_measured:.4f}"
+        f"opening (slit) rim measured after zip-close: x=[{x_lo:.4f},{x_hi:.4f}] "
+        f"z=[{z_lo:.4f},{z_hi:.4f}] rim_front_y={rim_front_y:.4f} "
+        f"lip_gap_mm_measured={lip_gap_mm_measured:.4f}"
     )
 
     bag_range = _measure_bag_extent(body, mat_idx, front_sign, lip_surface_y)
@@ -264,7 +400,9 @@ def run(ctx, cfg: dict) -> PhaseResult:
     split_ok = _lips_topologically_split(body, mat_idx, fissure_z)
     notes.append(f"lips_topologically_split={split_ok}")
 
-    # --- 3. teeth + tongue ---
+    # --- 7. teeth + tongue (placement logic unchanged; the bag interior,
+    # deeper than the rim ring, is untouched by zip-close) ---
+    insert_objs: list[tuple[str, object]] = []
     if mode == "reference_kept":
         actual_recess_mm = None
         t_bbox = teeth_ref_bbox
@@ -273,6 +411,8 @@ def run(ctx, cfg: dict) -> PhaseResult:
         notes.append(
             f"reference mode: kept existing teeth object, teeth_z_range={teeth_z_range}"
         )
+        insert_objs.append(("teeth", ctx.obj("teeth")))
+        insert_objs.append(("tongue", ctx.obj("tongue")))
     else:
         recess_mm_mid = sum(mouth_cfg["teeth_recess_mm"]) / 2.0
         recess_units = recess_mm_mid * _MM
@@ -331,6 +471,9 @@ def run(ctx, cfg: dict) -> PhaseResult:
             f"upper_recess_mm={upper_recess / _MM:.3f} lower_recess_mm={lower_recess / _MM:.3f} "
             f"z_center={z_center:.4f} (bag-interior centered)"
         )
+        insert_objs.append(("teeth_u", upper))
+        insert_objs.append(("teeth_l", lower))
+        insert_objs.append(("tongue", tongue))
 
     bag_check_range = bag_range if bag_range is not None else [z_lo, z_hi]
     if not (teeth_z_range[0] <= bag_check_range[1] and teeth_z_range[1] >= bag_check_range[0]):
@@ -338,6 +481,61 @@ def run(ctx, cfg: dict) -> PhaseResult:
             "WARNING: teeth_z_range does not overlap bag_z_range -- assertion "
             "table (P5) is expected to flag this"
         )
+
+    # --- 8. outside-skin guard: confirm the inserts actually ended up INSIDE
+    # the body (docs Phase 7 method: a sampled vert is outside iff
+    # (p - nearest.location).dot(nearest.normal) > 0 via the body's BVH). This
+    # is the second failure mode a razor-thin cutter used to hide silently --
+    # teeth/tongue placed relative to a botched bag measurement could end up
+    # visibly outside the skin while every other metric still passed.
+    #
+    # Before the final measurement, objects WE built (not a kept
+    # 'reference_kept' teeth object -- that one is never resized/moved) get
+    # the docs' own prescribed remedy for exactly this situation (Phase 7 fix
+    # order: re-center on the opening -> per-side back-off -> shrink-to-fit
+    # -> surgical vert pulls). A generic analytic arch/tongue shape, built
+    # independent of this specific mouth's real (often irregular) corner
+    # contour, can locally poke past the skin even though its *placement*
+    # (recess from the measured rim/bag) is correct. Two docs-sanctioned
+    # steps, in order: (1) `_recenter_search` -- a small local grid search
+    # for the nearby spot with the least poke, modeled directly on docs
+    # Phase 6's max-inscribed-sphere eyeball-fitting method (grid-search the
+    # center, maximize minimum clearance) -- bounded to a few mm so it can
+    # only nudge, never relocate the insert away from where the (unchanged)
+    # placement formula put it; (2) `_shrink_to_fit` for whatever residual
+    # poke remains.
+    body = ctx.obj("body")
+    body_bvh = _build_body_bvh(body, exclude_mat_idx=mat_idx)
+    shrink_target = _OUTSIDE_EPSILON_MM * _MM
+    inserts_outside_fraction = 0.0
+    outside_failures: list[str] = []
+    for label, insert_obj in insert_objs:
+        if label != "teeth":  # never resize/move a kept reference_kept teeth object
+            worst_before = _worst_outside_distance(insert_obj, body_bvh)
+            worst_recentered = _recenter_search(insert_obj, body_bvh)
+            if worst_recentered < worst_before - 1e-9:
+                notes.append(
+                    f"recenter-search: '{label}' ({insert_obj.name}) moved to "
+                    f"{tuple(round(c, 5) for c in insert_obj.location)}, worst poke "
+                    f"{worst_before / _MM:.3f}mm -> {worst_recentered / _MM:.3f}mm"
+                )
+            worst, iterations = _shrink_to_fit(insert_obj, body_bvh, shrink_target)
+            if iterations:
+                notes.append(
+                    f"shrink-to-fit: '{label}' ({insert_obj.name}) shrunk over "
+                    f"{iterations} step(s) (scale now {tuple(round(s, 4) for s in insert_obj.scale)}), "
+                    f"worst poke now {worst / _MM:.3f}mm"
+                )
+        frac = _outside_fraction(insert_obj, body_bvh)
+        notes.append(
+            f"outside-skin guard: '{label}' ({insert_obj.name}) outside_fraction={frac:.4f}"
+        )
+        inserts_outside_fraction = max(inserts_outside_fraction, frac)
+        if frac > 0.05:
+            outside_failures.append(
+                f"p5_mouth: insert '{label}' ({insert_obj.name}) has {frac:.1%} of "
+                "sampled vertices outside the body skin (> 5% threshold)"
+            )
 
     metrics = {
         "skipped": False,
@@ -349,7 +547,19 @@ def run(ctx, cfg: dict) -> PhaseResult:
         "lip_gap_mm_measured": lip_gap_mm_measured,
         "teeth_reference_kept": mode == "reference_kept",
         "lips_topologically_split": split_ok,
+        "rim_loop_count": rim_loop_count,
+        "inserts_outside_fraction": inserts_outside_fraction,
     }
+
+    if outside_failures:
+        return PhaseResult(
+            phase=PHASE_NAME,
+            status="needs_review",
+            metrics=metrics,
+            notes=notes,
+            failures=outside_failures,
+        )
+
     return PhaseResult(phase=PHASE_NAME, status="ok", metrics=metrics, notes=notes)
 
 
@@ -384,6 +594,72 @@ def _get_or_create_material(name: str, rgba: tuple):
         bsdf.inputs["Base Color"].default_value = rgba
     mat.diffuse_color = rgba
     return mat
+
+
+_TEMP_CAP_MAT = "_TempBoolCap"
+
+
+def _temp_cap_all_boundaries(body) -> int:
+    """Fill every open boundary loop with cap faces tagged by a temp material.
+
+    Returns the number of fill faces created. See the call site for why:
+    EXACT booleans need a watertight operand to reliably split the skin.
+    holes_fill first, triangle_fill for leftovers (same ladder as p4).
+    """
+    import bpy  # noqa: F401 (kept for parity with sibling helpers)
+    import bmesh
+
+    mat = _get_or_create_material(_TEMP_CAP_MAT, (0.0, 0.0, 0.0, 1.0))
+    slot_names = [m.name if m else None for m in body.data.materials]
+    if _TEMP_CAP_MAT not in slot_names:
+        body.data.materials.append(mat)
+        slot_names.append(_TEMP_CAP_MAT)
+    cap_idx = slot_names.index(_TEMP_CAP_MAT)
+
+    bm = bmesh.new()
+    bm.from_mesh(body.data)
+    boundary = [e for e in bm.edges if e.is_boundary]
+    new_faces: list = []
+    if boundary:
+        res = bmesh.ops.holes_fill(bm, edges=boundary, sides=0)
+        new_faces = [f for f in res.get("faces", []) if f.is_valid]
+        leftover = [e for e in bm.edges if e.is_valid and e.is_boundary]
+        if leftover:
+            res2 = bmesh.ops.triangle_fill(bm, edges=leftover, use_beauty=True)
+            new_faces += [
+                g
+                for g in res2.get("geom", [])
+                if isinstance(g, bmesh.types.BMFace) and g.is_valid
+            ]
+        for f in new_faces:
+            f.material_index = cap_idx
+        bm.to_mesh(body.data)
+        body.data.update()
+    bm.free()
+    return len(new_faces)
+
+
+def _remove_temp_caps(body) -> int:
+    """Delete all faces carrying the temp cap material and drop its slot."""
+    import bmesh
+
+    slot_names = [m.name if m else None for m in body.data.materials]
+    if _TEMP_CAP_MAT not in slot_names:
+        return 0
+    cap_idx = slot_names.index(_TEMP_CAP_MAT)
+
+    bm = bmesh.new()
+    bm.from_mesh(body.data)
+    doomed = [f for f in bm.faces if f.material_index == cap_idx]
+    count = len(doomed)
+    if doomed:
+        bmesh.ops.delete(bm, geom=doomed, context="FACES")
+    bm.to_mesh(body.data)
+    body.data.update()
+    bm.free()
+    # pop the now-empty slot (Blender >=2.81 remaps face material indices)
+    body.data.materials.pop(index=cap_idx)
+    return count
 
 
 def _boolean_difference(target_obj, cutter_obj_name: str) -> None:
@@ -457,110 +733,170 @@ def _reference_bag_size(
     return {"rx": rx, "ry": ry, "rz": rz}
 
 
+def _cutter_dims(mouth_cfg: dict, body_height: float, size_override: dict | None) -> tuple[float, float, float]:
+    """(rx, ry, rz) half-extents for the bag cutter -- shared by
+    `_dedupe_mouth_layers` (which needs the same footprint the cutter will
+    occupy) and `_make_mouth_cutter`, so both agree on the exact same
+    numbers.
+    """
+    if size_override is not None:
+        return size_override["rx"], size_override["ry"], size_override["rz"]
+    rx = mouth_cfg["cutter_radii"][0] * body_height
+    ry = mouth_cfg["cutter_radii"][1] * body_height
+    rz = mouth_cfg.get("bag_height", mouth_cfg["cutter_radii"][2]) * body_height
+    return rx, ry, rz
+
+
+def _dedupe_mouth_layers(
+    body_obj, mouth_x: float, fissure_z: float, front_sign: int, lip_surface_y: float,
+    rx: float, ry: float, rz: float,
+) -> int:
+    """Remove a redundant inner surface layer inside the cutter's own
+    footprint, before the boolean ever runs.
+
+    Real AI-generated meshes can carry pre-existing duplicate/hidden
+    mouth-interior geometry (CLAUDE.md's documented "dual/duplicated surface
+    layers" defect) -- verified directly on avatar_003: a grid of inward ray
+    casts across the whole mouth-cutter footprint found a SECOND surface a
+    few mm to ~2cm behind the true skin on every single sample. Even the fat,
+    non-tapered cutter (independently verified clean against a single-layer
+    surface) carves through BOTH layers there, producing several disconnected
+    rim loops that look identical to a torn/fragmented cut -- but the cutter
+    was never the problem; the duplicate layer was.
+
+    Method: for a grid of (x, z) sample points across the cutter's own x/z
+    footprint, cast a ray from outside the head inward (along -front_sign)
+    and collect every surface crossing within `2.2 * ry` of `lip_surface_y`
+    (comfortably covering the cutter's own front-to-back reach -- see
+    `_make_mouth_cutter`'s poke-margin derivation -- while stopping well
+    short of the head's FAR side, so this can never mistake the back of the
+    skull for a duplicate layer). The first (outermost) crossing per ray is
+    always kept as the true skin; every crossing after it is a redundant
+    inner layer and its face is deleted.
+
+    Safety: every deleted face's ray-hit lies within the cutter's own
+    front-to-back reach, so the hole it leaves is always a subset of what the
+    immediately-following boolean is about to carve out anyway -- this cannot
+    introduce an export-visible hole. No other region of the mesh is touched.
+    """
+    import bmesh
+    from mathutils import Vector
+    from mathutils.bvhtree import BVHTree
+
+    me = body_obj.data
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(me)
+        bm.verts.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        world = body_obj.matrix_world
+        world_verts = [world @ v.co for v in bm.verts]
+        face_vert_idx = [[v.index for v in f.verts] for f in bm.faces]
+        bvh = BVHTree.FromPolygons(world_verts, face_vert_idx)
+
+        n_grid = 16
+        x_half = rx * 1.1
+        z_half = max(rx, rz) * 1.1
+        ray_dir = Vector((0.0, -float(front_sign), 0.0))  # outside -> inward
+        start_offset = ry * 3.0
+        bound = 2.2 * ry
+
+        to_delete: set[int] = set()
+        for i in range(n_grid + 1):
+            x = mouth_x - x_half + 2 * x_half * i / n_grid
+            for j in range(n_grid + 1):
+                z = fissure_z - z_half + 2 * z_half * j / n_grid
+                origin = Vector((x, lip_surface_y + front_sign * start_offset, z))
+                cur = origin
+                hits: list[int] = []
+                for _ in range(6):  # generous depth cap; `bound` stops it far sooner
+                    hit = bvh.ray_cast(cur, ray_dir)
+                    if hit is None or hit[0] is None:
+                        break
+                    loc, _normal, idx, _dist = hit
+                    depth = front_sign * (lip_surface_y - loc.y)
+                    if depth > bound:
+                        break
+                    hits.append(idx)
+                    cur = loc + ray_dir * 1e-5
+                if len(hits) > 1:
+                    to_delete.update(hits[1:])
+
+        if not to_delete:
+            return 0
+        bm.faces.ensure_lookup_table()
+        faces = [bm.faces[i] for i in to_delete]
+        n_deleted = len(faces)
+        bmesh.ops.delete(bm, geom=faces, context="FACES")
+        # Cap the hole this leaves (holes_fill, sides=0 -- same pattern as
+        # _build_arch_object's open-end capping) so the mesh stays a CLOSED
+        # manifold going into the boolean. This cap is temporary -- it sits
+        # entirely inside the cutter's own volume (same guarantee as the
+        # deleted faces) and the boolean is about to remove it right back
+        # out -- but skipping this step was found empirically to make the
+        # subsequent EXACT boolean solver's result NON-DETERMINISTIC run to
+        # run on identical input (verified directly: 3 repeated runs of
+        # dedupe+boolean on the exact same avatar_003 snapshot gave
+        # rim_loop_count in {0, 0, 1} without capping, vs {1, 1, 1, 1} with
+        # it) -- almost certainly because feeding the solver a target mesh
+        # with a pre-existing open boundary nearly coincident with the
+        # cutter's own cut boundary is an ill-conditioned/degenerate
+        # configuration for its internal arrangement construction.
+        bm.edges.ensure_lookup_table()
+        boundary_edges = [e for e in bm.edges if e.is_boundary]
+        if boundary_edges:
+            bmesh.ops.holes_fill(bm, edges=boundary_edges, sides=0)
+        bm.to_mesh(me)
+        me.update()
+        return n_deleted
+    finally:
+        bm.free()
+
+
 def _make_mouth_cutter(
-    mouth_cfg: dict, body_height: float, mouth_x: float, fissure_z: float,
-    front_sign: int, lip_surface_y: float, size_override: dict | None = None,
-    notes: list | None = None,
+    mouth_x: float, fissure_z: float, front_sign: int, lip_surface_y: float,
+    rx: float, ry: float, rz: float,
 ) -> str:
-    """Build the closed-lips bag cutter.
+    """Build a plain, roomy bag cutter -- no taper.
 
     Local axes: x=width, y=depth (front = toward the lips, along front_sign),
-    z=height. Starts as an ellipsoid (rx, ry, rz), then a per-vertex z-ramp
-    on the FRONT half (front_sign * y_local > 0) tapers z down to a thin
-    horizontal slit of total height cfg mouth.lip_gap_mm exactly at the
-    local-Y depth (y0) where the cutter actually crosses the lip surface
-    (see the closed-form solve below), via a smoothstep of y_local/y0 -- the
-    BACK half (inside the head) is left at full rz height, which is the
-    "bag" that holds teeth/tongue.
+    z=height. A single ellipsoid (rx, ry, rz) -- see `_cutter_dims`. This is
+    deliberately the SAME fat shape that was previously proven to produce a
+    clean, single-loop rim on real AI-generated meshes (see module docstring
+    "Design history") -- an earlier version tapered the front half down to a
+    near-zero-thickness slit here, which shredded real meshes whose local
+    triangle size was an order of magnitude larger than the taper target.
+    Making the opening read as CLOSED lips is now entirely the job of the
+    separate zip-close step (`_zip_close`) that runs after the boolean, on
+    the rim this cutter carves.
     """
     import bpy
     import bmesh
     from mathutils import Matrix
-
-    if size_override is not None:
-        rx, ry, rz = size_override["rx"], size_override["ry"], size_override["rz"]
-    else:
-        rx = mouth_cfg["cutter_radii"][0] * body_height
-        ry = mouth_cfg["cutter_radii"][1] * body_height
-        rz = mouth_cfg.get("bag_height", mouth_cfg["cutter_radii"][2]) * body_height
 
     poke_margin = 0.15 * ry
     y0 = ry - poke_margin  # local-Y depth (magnitude) where the cutter surface
     # crosses the world plane Y=lip_surface_y -- since the cutter is only
     # translated (never rotated/sheared), EVERY point of its surface with
     # world Y==lip_surface_y has this exact same local Y, regardless of X or
-    # Z (see _make_mouth_cutter's derivation notes below); this is where the
-    # boolean actually carves the skin, not the sphere's Y-pole at y=ry.
+    # Z; this is where the boolean actually carves the skin, not the
+    # sphere's Y-pole at y=ry. Kept from the original design so the cutter
+    # pokes a small, controlled amount (15% of ry) past the skin surface
+    # rather than just grazing it.
     center_y = lip_surface_y - front_sign * y0
-
-    lip_gap_units = mouth_cfg.get("lip_gap_mm", 0.4) * _MM
-    slit_half = lip_gap_units / 2.0
-
-    # The untapered ellipsoid's own half-height at local depth y0, x=0 is
-    # rz*sqrt(1-(y0/ry)^2) (the ellipsoid equation) -- NOT rz, because y0 is
-    # already partway toward the pole. A taper that reaches its nominal
-    # "full slit_half/rz" factor only in the limit y->ry (the actual pole)
-    # therefore stays well short of that factor AT y0, where the cut really
-    # happens (verified empirically: with the taper's endpoint at y=ry, the
-    # ellipsoid's own narrowing plus an under-shot taper factor left
-    # lip_gap_mm_measured ~1.6-1.8mm regardless of mesh resolution -- a
-    # geometry bug, not a discretization artifact). Solving directly for the
-    # taper factor f0 that makes the cutter's half-height AT y0 equal
-    # slit_half exactly: rz*f0*sqrt(1-(y0/ry)^2) == slit_half.
-    sqrt_term = math.sqrt(max(0.0, 1.0 - (y0 / ry) ** 2)) if ry > 1e-9 else 0.0
-    degenerate = rz <= 1e-9 or sqrt_term <= 1e-6
-    slit_factor = 1.0
-    if not degenerate:
-        slit_factor = slit_half / (rz * sqrt_term)
-        if slit_factor >= 1.0:
-            degenerate = True  # target slit isn't thinner than the natural shape at y0
-    if degenerate and notes is not None:
-        notes.append(
-            f"mouth cutter: lip_gap_mm target ({lip_gap_units:.5f}) is not thinner than "
-            f"the bag's natural cross-section at the poke depth (rz={rz:.5f}); "
-            "skipping the slit taper (degenerate config), cutter stays a plain bag"
-        )
-    slit_factor = max(min(slit_factor, 1.0), 1e-6)
 
     bm = bmesh.new()
     bmesh.ops.create_uvsphere(bm, u_segments=24, v_segments=20, radius=1.0)
-    # bmesh.ops.create_uvsphere puts its poles on Z, so its "rings" (latitude
-    # bands) are constant-Z, NOT constant-Y -- within any one ring, Y varies
-    # freely from -sin(phi) to +sin(phi) as the ring wraps around in X/Y.
-    # Tapering per-vertex on raw Y (as a first attempt did) therefore only
-    # thins the handful of vertices nearest the Y-pole; vertices on the SAME
-    # ring but nearer the ring's X-extremes (the mouth CORNERS once scaled)
-    # keep their full pre-taper Z and the "slit" ends up tall at the corners
-    # regardless of resolution (verified empirically: lip_gap_mm_measured
-    # stayed ~1.8mm at both 32x24 and 160x120 sphere segments -- a geometric
-    # effect, not a discretization artifact). Rotating -90 degrees about X
-    # first ((x,y,z) -> (x,z,-y), a proper rotation, det=+1) moves the poles
-    # onto Y, so rings become constant-Y depth bands and the per-vertex taper
-    # below -- which depends only on Y -- now scales EVERY vertex in a ring
-    # (i.e. the full X/Z circle at that depth) by the same factor, giving a
-    # uniformly thin slit across the whole mouth width instead of just at
-    # its center.
+    # bmesh.ops.create_uvsphere puts its poles on Z; rotating -90 degrees
+    # about X ((x,y,z) -> (x,z,-y), a proper rotation, det=+1) moves the
+    # poles onto Y so the cutter's front/back axis matches the depth axis
+    # used everywhere else in this module (front_sign along Y).
     for v in bm.verts:
         vx, vy, vz = v.co.x, v.co.y, v.co.z
         v.co.x = vx
         v.co.y = vz
         v.co.z = -vy
     bmesh.ops.scale(bm, vec=(rx, ry, rz), space=Matrix.Identity(4), verts=bm.verts)
-
-    if not degenerate:
-        for v in bm.verts:
-            y_local = v.co.y
-            if front_sign * y_local > 0:
-                # Normalized by y0 (the poke-depth ring), not ry (the pole):
-                # t reaches 1.0 (full taper, f == slit_factor) exactly at the
-                # ring where the boolean cut happens, and stays clamped at
-                # slit_factor for the remaining sliver out to the pole (y0 <
-                # ry by poke_margin) -- that sliver just pokes past the skin
-                # and is never visible, so flattening it out is harmless.
-                t = min(abs(y_local) / y0, 1.0) if y0 > 1e-9 else 1.0
-                s = t * t * (3.0 - 2.0 * t)  # smoothstep(0,1,t)
-                f = 1.0 + (slit_factor - 1.0) * s
-                v.co.z *= f
 
     me = bpy.data.meshes.new("MouthCutter_mesh")
     bm.to_mesh(me)
@@ -578,16 +914,74 @@ def _make_mouth_cutter(
     return obj.name
 
 
-def _squeeze_slit_to_target(body_obj, mat_idx: int, fissure_z: float, target_half_gap: float) -> int:
-    """Pull every Mouth_Interior-rim vertex's world Z back to within
-    `target_half_gap` of `fissure_z`, clamping (not rescaling) so vertices
-    already inside the target stay put -- only outliers move. Returns the
-    number of vertices moved. See the safety-net comment at the call site
-    for why this exists (irregular real meshes can produce a much wider raw
-    cut than the cutter's own thin design intends).
+def _count_rim_loops(body_obj, mat_idx: int) -> int:
+    """Union-find over rim edges (border between the skin and Mouth_Interior
+    materials) sharing a vertex -> number of disconnected rim loops.
+
+    A healthy single-pass boolean cut through the fat cutter produces exactly
+    one continuous loop around the opening (occasionally two, tolerated); a
+    torn/fragmented cut produces several. Returns 0 if there is no rim at all
+    (caller treats that as a separate "opening not found" condition).
+    """
+    import bmesh
+
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(body_obj.data)
+        bm.edges.ensure_lookup_table()
+        rim_edges = []
+        for e in bm.edges:
+            faces = e.link_faces
+            if len(faces) != 2:
+                continue
+            mis = {f.material_index for f in faces}
+            if mat_idx in mis and len(mis) == 2:
+                rim_edges.append(e)
+        if not rim_edges:
+            return 0
+        vert_ids = sorted({v.index for e in rim_edges for v in e.verts})
+        idx_of = {vid: i for i, vid in enumerate(vert_ids)}
+        ds = geom.DisjointSet(len(vert_ids))
+        for e in rim_edges:
+            v0, v1 = e.verts
+            ds.union(idx_of[v0.index], idx_of[v1.index])
+        return len(ds.groups())
+    finally:
+        bm.free()
+
+
+def _zip_close(
+    body_obj, mat_idx: int, fissure_z: float, lip_gap_units: float,
+    x_lo: float, x_hi: float, opening_height: float,
+) -> tuple[int, int]:
+    """Move the rim (and a locality-guarded 1-ring falloff) in Z only, onto a
+    thin band straddling `fissure_z`, so the carved-open mouth reads as
+    closed lips. Returns (rim_verts_moved, falloff_neighbors_moved).
+
+    - Rim verts (border between skin and Mouth_Interior materials) go exactly
+      onto fissure_z +/- half_gap, picking the side matching their current Z
+      (verts already above fissure_z go to +half_gap, at/below go to
+      -half_gap). Mouth-corner rim verts, which sit near fissure_z and belong
+      to both the upper and lower rim arcs, naturally converge toward the
+      plane through this same rule -- an anatomically correct pinch, not a
+      bug.
+    - Skin-side 1-ring neighbors of rim verts (touch only non-Mouth_Interior
+      faces) lerp 50% of the way toward the same target; cavity-side 1-ring
+      neighbors (touch only Mouth_Interior faces) lerp 30%. Both are
+      restricted to the opening's x-range and to |z - fissure_z| <= 2x the
+      pre-zip opening height, so the falloff cannot drag distant geometry.
+    - X/Y are never touched, and no verts/edges/faces are added or removed
+      (delete-nothing invariant) -- this can only relocate vertices that
+      already exist on the (already-verified-clean) boolean output.
     """
     import bmesh
     from mathutils import Vector
+
+    half_gap = lip_gap_units / 2.0
+    locality_z_limit = 2.0 * opening_height
+
+    def target_z(w_z: float) -> float:
+        return fissure_z + half_gap if w_z > fissure_z else fissure_z - half_gap
 
     me = body_obj.data
     bm = bmesh.new()
@@ -608,23 +1002,285 @@ def _squeeze_slit_to_target(body_obj, mat_idx: int, fissure_z: float, target_hal
                 rim_vert_idx.add(e.verts[0].index)
                 rim_vert_idx.add(e.verts[1].index)
 
-        moved = 0
+        # (1) snap every rim vert exactly onto the fissure-plane band.
+        rim_moved = 0
         for vi in rim_vert_idx:
             v = bm.verts[vi]
             w = world @ v.co
-            offset = w.z - fissure_z
-            if abs(offset) > target_half_gap:
-                clamped_offset = target_half_gap if offset > 0 else -target_half_gap
-                w2 = Vector((w.x, w.y, fissure_z + clamped_offset))
-                v.co = world_inv @ w2
-                moved += 1
+            w2 = Vector((w.x, w.y, target_z(w.z)))
+            v.co = world_inv @ w2
+            rim_moved += 1
 
-        if moved:
-            bm.to_mesh(me)
-            me.update()
-        return moved
+        # (2) classify each non-rim 1-ring neighbor as skin-side (touches only
+        # non-Mouth_Interior faces) or cavity-side (touches only
+        # Mouth_Interior faces); a mixed-material neighbor (shouldn't
+        # normally occur one ring out from a true rim vert) falls back to the
+        # more conservative skin-side treatment.
+        neighbor_frac: dict[int, float] = {}
+        for vi in rim_vert_idx:
+            v = bm.verts[vi]
+            for e in v.link_edges:
+                other = e.other_vert(v)
+                oi = other.index
+                if oi in rim_vert_idx:
+                    continue
+                touches_cavity = any(f.material_index == mat_idx for f in other.link_faces)
+                touches_skin = any(f.material_index != mat_idx for f in other.link_faces)
+                if touches_cavity and not touches_skin:
+                    frac = 0.30
+                elif touches_skin:
+                    frac = 0.50
+                else:
+                    continue  # isolated vert with no faces -- nothing to classify
+                if oi not in neighbor_frac or frac > neighbor_frac[oi]:
+                    neighbor_frac[oi] = frac
+
+        neighbors_moved = 0
+        for vi, frac in neighbor_frac.items():
+            v = bm.verts[vi]
+            w = world @ v.co
+            if not (x_lo <= w.x <= x_hi):
+                continue
+            if abs(w.z - fissure_z) > locality_z_limit:
+                continue
+            new_z = w.z + frac * (target_z(w.z) - w.z)
+            w2 = Vector((w.x, w.y, new_z))
+            v.co = world_inv @ w2
+            neighbors_moved += 1
+
+        bm.to_mesh(me)
+        me.update()
+        return rim_moved, neighbors_moved
     finally:
         bm.free()
+
+
+def _build_body_bvh(body_obj, exclude_mat_idx: int | None = None):
+    """Triangulated, world-space BVH of the (evaluated) body mesh.
+
+    Same construction as p9_export._build_world_bvh (docs Phase 7 method),
+    duplicated locally rather than imported across phase modules to keep each
+    phase module self-contained per the existing convention in this file --
+    with one addition: `exclude_mat_idx` drops faces of that material from
+    the BVH entirely.
+
+    This matters for the outside-skin guard: after a DIFFERENCE boolean, the
+    newly carved Mouth_Interior cavity walls get their normals pointing INTO
+    the cavity (the standard "normal points away from remaining solid"
+    convention -- the cavity is now empty space, so its bounding walls face
+    into that emptiness). A point legitimately placed inside the bag is
+    therefore on the outward side of its NEAREST cavity-wall face by
+    construction, regardless of how correctly it is placed -- a whole-body
+    BVH that includes those walls would flag virtually every interior insert
+    vertex as "outside" (verified empirically: >70% false-positive rate on
+    correctly placed teeth). This is the same class of false positive the
+    docs' Phase 7 eye check warns about (a cornea legitimately poking through
+    an opening reads as "outside" against a naive check), just triggered by
+    every interior vertex instead of only ones near the opening. Excluding
+    the cavity material's own faces makes the BVH represent the body's real
+    exterior skin only, so the check measures what it says it measures --
+    "outside the body skin" -- while still catching genuine poke-through
+    (an insert vertex beyond the real skin surface has no cavity wall to hide
+    behind).
+    """
+    import bpy
+    import bmesh
+    from mathutils.bvhtree import BVHTree
+
+    bpy.context.view_layer.update()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj = body_obj.evaluated_get(depsgraph)
+    me = eval_obj.to_mesh()
+    try:
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        bmesh.ops.triangulate(bm, faces=bm.faces)
+        bm.verts.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        mat = body_obj.matrix_world.copy()
+        world_verts = [mat @ v.co for v in bm.verts]
+        if exclude_mat_idx is None:
+            faces = bm.faces
+        else:
+            faces = [f for f in bm.faces if f.material_index != exclude_mat_idx]
+        tris_vert_idx = [[v.index for v in f.verts] for f in faces]
+        bvh = BVHTree.FromPolygons(world_verts, tris_vert_idx)
+        bm.free()
+        return bvh
+    finally:
+        eval_obj.to_mesh_clear()
+
+
+_OUTSIDE_EPSILON_MM = 2.0  # tolerance below which a "poke" reads as near-touching
+# contact, not a defect (docs Phase 7 method compares strictly > 0, but that is
+# too strict at real-mesh scale: empirically, on both the synthetic fixture and
+# avatar_003, teeth built by _place_arch from a SINGLE front-most rim reference
+# point graze up to ~1.6mm past the body's *locally* curved skin surface at
+# other points along the arch, even though they are correctly recessed from
+# the reference point -- a real, small precision artifact of using one
+# reference point against a curved surface, not the gross "teeth ended up
+# outside the skin" failure this guard exists to catch (that failure mode, see
+# module docstring "Design history", was mesh-shredding-scale). Teeth/tongue
+# resting at or a shade proud of their recess target is also anatomically
+# normal (lips touch teeth). 2mm sits comfortably below teeth_recess_mm's own
+# [1,2]mm config range and far below anything "visibly outside."
+
+
+def _outside_fraction(obj, body_bvh, max_samples: int = 50) -> float:
+    """Fraction of up to `max_samples` (evenly strided) verts of `obj` that
+    lie OUTSIDE the body, per docs Phase 7: a vert is outside iff
+    (p - nearest.location).dot(nearest.normal) > 0, using the body's BVH
+    `find_nearest` -- with a small tolerance, see `_OUTSIDE_EPSILON_MM`.
+    """
+    import bpy
+
+    epsilon = _OUTSIDE_EPSILON_MM * _MM
+    bpy.context.view_layer.update()
+    mat = obj.matrix_world
+    verts = obj.data.vertices
+    n = len(verts)
+    if n == 0:
+        return 0.0
+    stride = max(1, n // max_samples)
+    sampled = 0
+    outside = 0
+    for i in range(0, n, stride):
+        if sampled >= max_samples:
+            break
+        p = mat @ verts[i].co
+        hit = body_bvh.find_nearest(p)
+        if hit is None or hit[0] is None:
+            continue
+        loc, normal, _idx, _dist = hit
+        sampled += 1
+        if (p - loc).dot(normal) > epsilon:
+            outside += 1
+    if sampled == 0:
+        return 0.0
+    return outside / sampled
+
+
+def _worst_outside_distance(obj, body_bvh, max_samples: int = 500) -> float:
+    """Max (p - nearest.location).dot(nearest.normal) over up to
+    `max_samples` sampled verts of `obj` -- the same test as
+    `_outside_fraction`, but returning the worst signed poke distance
+    instead of a pass/fail count, for `_recenter_search`/`_shrink_to_fit`'s
+    optimization loops. Default is intentionally much larger than
+    `_outside_fraction`'s spec-mandated 50 (every insert mesh here has well
+    under 500 verts, so this checks ALL of them) -- optimizing against a
+    strided subset caused a real bug during development: a candidate could
+    look like an improvement under one stride and then regress once
+    `_shrink_to_fit` re-sampled with a different stride and caught a
+    different worst vertex the search never saw. `_outside_fraction` itself
+    (the actual pass/fail measurement) is unaffected and still samples <= 50,
+    per spec.
+    Returns a large negative number if no vert could be sampled.
+    """
+    import bpy
+
+    bpy.context.view_layer.update()
+    mat = obj.matrix_world
+    verts = obj.data.vertices
+    n = len(verts)
+    if n == 0:
+        return -1.0
+    stride = max(1, n // max_samples)
+    worst = -1e9
+    for i in range(0, n, stride):
+        p = mat @ verts[i].co
+        hit = body_bvh.find_nearest(p)
+        if hit is None or hit[0] is None:
+            continue
+        loc, normal, _idx, _dist = hit
+        worst = max(worst, (p - loc).dot(normal))
+    return worst
+
+
+_RECENTER_SEARCH_RADIUS_MM = 3.0  # per-axis max offset tried, see _recenter_search
+_RECENTER_SEARCH_STEPS = (-1.0, -0.5, 0.0, 0.5, 1.0)  # fractions of the radius, per axis
+
+
+def _recenter_search(obj, body_bvh, max_samples: int = 500) -> float:
+    """Local grid search for the nearby spot that minimizes `obj`'s worst
+    outside-the-body poke, and move `object.location` there if it is an
+    improvement.
+
+    Modeled directly on docs Phase 6's eyeball-fitting method ("Placement =
+    max-inscribed-sphere fit: grid-search the center (+/- few mm) maximizing
+    the minimum ray-cast clearance to the skin") -- applied here to teeth/
+    tongue for the same reason: a small, local repositioning can find real
+    available clearance that a purely analytic (recess-from-a-single-point)
+    placement cannot see. Bounded to `_RECENTER_SEARCH_RADIUS_MM` per axis so
+    this can only nudge the insert, never relocate it away from where the
+    (unchanged) placement formula intended it.
+
+    Returns the best (lowest) worst-poke value found (== the pre-search
+    value if no candidate improved on it, in which case `object.location` is
+    left unchanged).
+    """
+    import bpy
+    from mathutils import Vector
+
+    radius = _RECENTER_SEARCH_RADIUS_MM * _MM
+    base_loc = Vector(obj.location)
+    best_loc = base_loc
+    best_worst = _worst_outside_distance(obj, body_bvh, max_samples)
+
+    for fx in _RECENTER_SEARCH_STEPS:
+        for fy in _RECENTER_SEARCH_STEPS:
+            for fz in _RECENTER_SEARCH_STEPS:
+                if fx == 0.0 and fy == 0.0 and fz == 0.0:
+                    continue
+                obj.location = base_loc + Vector((fx, fy, fz)) * radius
+                bpy.context.view_layer.update()
+                worst = _worst_outside_distance(obj, body_bvh, max_samples)
+                if worst < best_worst:
+                    best_worst = worst
+                    best_loc = Vector(obj.location)
+
+    obj.location = best_loc
+    bpy.context.view_layer.update()
+    return best_worst
+
+
+def _shrink_to_fit(
+    obj, body_bvh, target_epsilon: float, max_iterations: int = 8, shrink_step: float = 0.93,
+) -> tuple[float, int]:
+    """Uniformly shrink `obj` about its own origin (`object.scale`, applied
+    in place) until its worst outside-the-body poke is <= `target_epsilon`,
+    or `max_iterations` is reached.
+
+    This is the docs Phase 7 "shrink-to-fit" remedy (fix order: re-center on
+    the opening -> per-side back-off -> shrink-to-fit -> surgical vert pulls)
+    -- see the call site for why it applies here. `object.scale` alone is
+    sufficient (no separate pivot bookkeeping needed): none of the insert
+    objects this is called on carry rotation, so `matrix_world` scales
+    directly about `object.location`, which is exactly the placement anchor
+    each insert was positioned from.
+
+    A combined shrink + per-side-back-off (translate opposite the poke
+    direction) variant was tried and rejected: on avatar_003 it was
+    non-monotonic (the 'tongue' insert's worst poke got WORSE, 9.06mm ->
+    9.14mm, because currently-outside verts on opposite sides of the object
+    pull the weighted-average push direction into a net-unhelpful
+    compromise). Pure shrink toward a fixed origin is monotonically safer:
+    it can only ever move the worst poke toward "the poke at the object's
+    own center," never past it -- so a plateau here is informative (see the
+    call site's handling of a non-converged result) rather than a sign this
+    function made things worse.
+
+    Returns (final worst-poke distance, iterations actually used).
+    """
+    import bpy
+
+    worst = _worst_outside_distance(obj, body_bvh)
+    iterations = 0
+    while worst > target_epsilon and iterations < max_iterations:
+        obj.scale = tuple(s * shrink_step for s in obj.scale)
+        bpy.context.view_layer.update()
+        worst = _worst_outside_distance(obj, body_bvh)
+        iterations += 1
+    return worst, iterations
 
 
 def _measure_mouth_opening(body_obj, mat_idx: int):
@@ -705,10 +1361,10 @@ def _lips_topologically_split(body_obj, mat_idx: int, fissure_z: float) -> bool:
     here only counts a vertex toward `upper`/`lower` via a "pure" rim edge
     (BOTH endpoints strictly on the same side of fissure_z); an edge that
     straddles fissure_z (a mouth-corner transition edge) contributes to
-    neither bucket. A genuinely fused/botched cut -- where the taper failed
-    and a wide band of material still connects across the slit -- produces
-    actual PURE-edge vertices shared between both sides (not just the two
-    corner transition points), which this still catches.
+    neither bucket. A genuinely fused/botched cut -- where a wide band of
+    material still connects the upper and lower rim across the fissure --
+    produces actual PURE-edge vertices shared between both sides (not just
+    the two corner transition points), which this still catches.
     """
     import bmesh
 

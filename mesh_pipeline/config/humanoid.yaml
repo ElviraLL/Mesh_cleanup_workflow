@@ -70,3 +70,5 @@ qa:
   # p4 assertion: boundary edges tolerated in body+legs z-bands (tiny
   # unfillable slit fragments are normal on real AI meshes; 0 is aspirational)
   max_body_boundary_edges: 20
+  # p7 assertion: confirmed UV island overlaps tolerated after pack (0 = strict)
+  max_uv_overlaps: 0
