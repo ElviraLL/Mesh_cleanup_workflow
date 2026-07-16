@@ -303,11 +303,24 @@ def _find_lip_line(body_obj, bbox: dict, notes: list):
         head_lo = zmax - 0.30 * height
         head_hi = zmax - 0.02 * height
 
+        # x-centrality constraint: the mouth sits on the sagittal plane. In a
+        # T-pose the wrists/hands are at the SAME height as the chin, and a
+        # glove seam there is exactly the kind of sharp-edge cluster the
+        # detector otherwise latches onto (avatar_003: lip line "found" at
+        # x=0.46 on the wrist -> mouth carved into the arm, caught by p9's
+        # penetration test). Restrict everything to the central band of the
+        # x extent.
+        x_center = (bbox["min"].x + bbox["max"].x) / 2.0
+        x_half_limit = 0.10 * max(bbox["max"].x - bbox["min"].x, 1e-9)
+
+        def _central(wco) -> bool:
+            return abs(wco.x - x_center) <= x_half_limit
+
         # front-axis heuristic
         band_ys = []
         for v in bm.verts:
             wco = mat @ v.co
-            if head_lo <= wco.z <= head_hi:
+            if head_lo <= wco.z <= head_hi and _central(wco):
                 band_ys.append(wco.y)
         if not band_ys:
             notes.append("lip detection: no vertices found in the candidate head z-band")
@@ -337,6 +350,9 @@ def _find_lip_line(body_obj, bbox: dict, notes: list):
             if not (head_lo <= mid_z <= head_hi):
                 continue
             if front_sign * mid_y <= 0:
+                continue
+            mid = (w0 + w1) / 2.0
+            if not _central(mid):
                 continue
             is_boundary = e.is_boundary
             is_sharp = not e.smooth

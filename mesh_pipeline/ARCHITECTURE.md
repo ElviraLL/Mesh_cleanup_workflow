@@ -86,6 +86,13 @@ Implements the PLAN.md table (P2 component count, P3 deletion band, P4 boundary
 z-bands, P5 teeth recess, P6 eye asymmetry with one auto local-visibility retry,
 P7 island count/overlap, P8 non-empty bake, P9 exact tri-tri penetration = 0).
 
+P7's `uv.max_islands` cap applies only when p7's re-unwrap owns the resulting
+layout (`faces_reunwrapped > 0.5 * faces_total`); when p7 kept the input's
+pre-existing unwrap and only touched a minority of faces, the island count
+reflects the input, not p7's work, so the cap is skipped. `island_overlap_count
+== 0` is always required, computed via the two-stage bbox-candidate +
+point-in-triangle test described in `p7_uv_atlas.py`.
+
 ## Report (`report.py`)
 
 `report.json` schema:
@@ -113,7 +120,7 @@ emit them (assertions treat a missing key as a failure, not a pass):
 | p4_topology | `boundary_edges_before`, `boundary_edges_after`, `boundary_by_zband` (dict zband->count; zbands: `"body"`, `"legs"`, `"head_hair"`), `holes_filled`, `flaps_deleted`, `fins_deleted` |
 | p5_mouth | `skipped` (bool), `teeth_recess_mm` (float), `opening_z_range` ([lo,hi]), `teeth_z_range` ([lo,hi]) |
 | p6_eyes | `skipped` (bool), `clearance_l`, `clearance_r`, `asymmetry_ratio` (abs(l-r)/max(l,r)), `local_visibility_retried` (bool) |
-| p7_uv_atlas | `uv_islands_before`, `uv_islands_after`, `island_overlap_count` |
+| p7_uv_atlas | `uv_islands_before`, `uv_islands_after`, `island_overlap_count`, `faces_total`, `faces_reunwrapped` |
 | p8_bake | `channels` (list), `atlas_stats` (dict channel -> {mean, nonzero_ratio}) |
 | p9_export | `penetration_count`, `export_path`, `object_names` (list) |
 

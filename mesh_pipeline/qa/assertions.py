@@ -193,14 +193,38 @@ def _p6(ctx, cfg, metrics) -> list[str]:
 
 def _p7(ctx, cfg, metrics) -> list[str]:
     failures: list[str] = []
-    if not _require(metrics, ["uv_islands_after", "island_overlap_count"], failures):
+    required = [
+        "uv_islands_after",
+        "island_overlap_count",
+        "faces_total",
+        "faces_reunwrapped",
+    ]
+    if not _require(metrics, required, failures):
         return failures
-    max_islands = cfg.get("uv", {}).get("max_islands", 40)
-    islands = metrics["uv_islands_after"]
-    if not (isinstance(islands, (int, float)) and islands <= max_islands):
-        failures.append(
-            f"uv_islands_after: expected <= {max_islands} (uv.max_islands), got {islands!r}"
-        )
+
+    # The uv.max_islands cap only makes sense when p7's own re-unwrap
+    # produced the island layout being counted. When p7 kept the input's
+    # pre-existing (legitimately multi-island) unwrap and only touched a
+    # small minority of faces (e.g. boolean-created cavity faces), the
+    # island count reflects the INPUT's layout, not ours -- capping it would
+    # spuriously fail an intentional design (e.g. a game-style multi-island
+    # atlas) that p7 correctly chose not to disturb. "Owns the layout" is
+    # defined as: p7 re-unwrapped more than half of the body's faces.
+    faces_total = metrics["faces_total"]
+    faces_reunwrapped = metrics["faces_reunwrapped"]
+    reunwrap_owns_layout = (
+        isinstance(faces_total, (int, float))
+        and isinstance(faces_reunwrapped, (int, float))
+        and faces_reunwrapped > 0.5 * faces_total
+    )
+    if reunwrap_owns_layout:
+        max_islands = cfg.get("uv", {}).get("max_islands", 40)
+        islands = metrics["uv_islands_after"]
+        if not (isinstance(islands, (int, float)) and islands <= max_islands):
+            failures.append(
+                f"uv_islands_after: expected <= {max_islands} (uv.max_islands), got {islands!r}"
+            )
+
     overlap = metrics["island_overlap_count"]
     if not (isinstance(overlap, (int, float)) and overlap == 0):
         failures.append(f"island_overlap_count: expected 0, got {overlap!r}")

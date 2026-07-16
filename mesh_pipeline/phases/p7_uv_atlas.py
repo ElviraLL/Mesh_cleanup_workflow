@@ -40,10 +40,17 @@ task spec:
    own warning) and silently break those textures while buying nothing, since
    p8 bakes the atlas for the body alone. The body's UV layer is normalized
    to "UVMap" first.
-7. Recount islands after, and compute `island_overlap_count` via pairwise
-   UV-space bounding-box overlap across the body's islands (documented
-   approximation -- true polygon overlap would need rasterization; bbox
-   overlap is the accepted v1 test per the task spec).
+7. Recount islands after, and compute `island_overlap_count` via a two-stage
+   test across the body's islands: pairwise UV-space bounding-box overlap as
+   a cheap candidate filter, then an exact point-in-triangle confirmation
+   (fan-triangulated island geometry, up to 40 sample points from the
+   smaller candidate island tested against the larger's triangles) so
+   organic/concave islands that merely share a bounding box -- but not
+   actual UV-space area -- are no longer counted as false positives. Also
+   records `faces_total` (body face count at phase end) and
+   `faces_reunwrapped` (how many dirty faces were actually re-unwrapped in
+   step 5) so assertions can tell whether p7 owns the resulting island count
+   or merely preserved the input's pre-existing layout.
 """
 
 from __future__ import annotations
@@ -72,6 +79,11 @@ _ALWAYS_DIRTY_MATERIALS = {_MOUTH_INTERIOR_MAT, _SOCKET_INTERIOR_MAT}
 # A material-slot's own faces are considered "dirty" (confetti / no clean
 # unwrap) once its island count reaches this fraction of its own face count.
 _CONFETTI_RATIO = 0.9
+
+# UV islands smaller than this many faces inside an otherwise-clean slot are
+# re-unwrapped anyway (broken sliver remnants; pack_islands stacks them
+# inside larger islands -- see _dirty_face_indices).
+_SLIVER_ISLAND_FACES = 4
 
 _AXES: list[tuple[float, float, float]] = [
     (1.0, 0.0, 0.0),
@@ -129,29 +141,37 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
     # -- (7) islands after + overlap check -----------------------------------
     body_after = ctx.obj("body")
     uv_islands_after = geom.uv_island_count(body_after.data)
+    faces_total = len(body_after.data.polygons)
+    faces_reunwrapped = len(dirty_indices)
 
-    all_bboxes: list[tuple[float, float, float, float]] = []
+    all_islands: list[dict] = []
     per_object_islands: dict[str, int] = {}
     for name in deliverable_names:
         obj = bpy.data.objects[name]
-        bboxes = _uv_island_bboxes(obj.data)
-        per_object_islands[name] = len(bboxes)
-        all_bboxes.extend(bboxes)
+        islands = _uv_island_data(obj.data)
+        per_object_islands[name] = len(islands)
+        all_islands.extend(islands)
 
-    island_overlap_count = _count_bbox_overlaps(all_bboxes)
+    island_overlap_count, candidate_pair_count = _count_island_overlaps(all_islands)
 
     notes.append(f"uv_islands_after (body, {body_name!r}) = {uv_islands_after}")
+    notes.append(
+        f"faces_total (body, {body_name!r}) = {faces_total}; "
+        f"faces_reunwrapped = {faces_reunwrapped}"
+    )
     notes.append(f"per-object island counts (post-pack): {per_object_islands}")
     notes.append(
         f"island_overlap_count = {island_overlap_count} "
-        "(pairwise UV bbox overlap across all deliverable objects' islands -- "
-        "an approximation, not exact polygon overlap; see module docstring)"
+        f"({candidate_pair_count} bbox-candidate pair(s) from stage 1, confirmed "
+        "by exact point-in-triangle test in stage 2 -- see module docstring)"
     )
 
     metrics = {
         "uv_islands_before": uv_islands_before,
         "uv_islands_after": uv_islands_after,
         "island_overlap_count": island_overlap_count,
+        "faces_total": faces_total,
+        "faces_reunwrapped": faces_reunwrapped,
     }
 
     return PhaseResult(phase=PHASE_NAME, status="ok", metrics=metrics, notes=notes)
@@ -260,7 +280,8 @@ def _dirty_face_indices(
             )
             dirty.extend(face_idxs)
             continue
-        islands = _island_count_subset(bm, uvl, face_idxs)
+        groups = _island_groups_subset(bm, uvl, face_idxs)
+        islands = len(groups)
         is_dirty = islands >= _CONFETTI_RATIO * len(face_idxs)
         notes.append(
             f"dirty-face decision: material_index={mat_idx} faces={len(face_idxs)} "
@@ -268,11 +289,29 @@ def _dirty_face_indices(
         )
         if is_dirty:
             dirty.extend(face_idxs)
+            continue
+        # Within a kept-clean slot, sliver islands (< _SLIVER_ISLAND_FACES
+        # faces) are re-unwrapped anyway: they're broken remnants of the soup
+        # layout, not preserved artistry. pack_islands cannot place them
+        # meaningfully and stacks them inside larger islands (avatar_003
+        # calibration: 5 genuine post-pack overlaps, all 1-2-face slivers).
+        sliver_faces = [fi for g in groups if len(g) < _SLIVER_ISLAND_FACES for fi in g]
+        if sliver_faces:
+            notes.append(
+                f"dirty-face decision: material_index={mat_idx}: "
+                f"{len(sliver_faces)} face(s) in sliver islands "
+                f"(< {_SLIVER_ISLAND_FACES} faces) -> DIRTY despite clean slot"
+            )
+            dirty.extend(sliver_faces)
     return dirty
 
 
-def _island_count_subset(bm, uvl, face_idxs: list[int]) -> int:
-    """Union-find island count restricted to a subset of faces (by index)."""
+def _island_groups_subset(bm, uvl, face_idxs: list[int]) -> list[list[int]]:
+    """Union-find UV islands restricted to a subset of faces (by index).
+
+    Returns the islands as lists of face indices (len() of the result is the
+    island count previously returned by _island_count_subset).
+    """
     face_set = set(face_idxs)
     local_of = {fi: i for i, fi in enumerate(face_idxs)}
     ds = geom.DisjointSet(len(face_idxs))
@@ -292,7 +331,7 @@ def _island_count_subset(bm, uvl, face_idxs: list[int]) -> int:
             b2 = l2[uvl].uv
             if (a1 - a2).length < 1e-6 and (b1 - b2).length < 1e-6:
                 ds.union(local_of[f1], local_of[f2])
-    return len(ds.groups())
+    return [[face_idxs[i] for i in members] for members in ds.groups().values()]
 
 
 def _dominant_axis_label(normal) -> int:
@@ -372,11 +411,73 @@ def _pack_islands_multi_object(object_names: list[str], active_name: str) -> Non
 
 
 # ---------------------------------------------------------------------------
-# (7): post-pack island bboxes + overlap count
+# (7): post-pack island geometry + two-stage overlap test
 # ---------------------------------------------------------------------------
+#
+# Stage 1 (cheap filter): pairwise UV-space bounding-box overlap, exactly as
+# before -- this alone produced false positives on organic/concave islands
+# that share a bbox without sharing any actual UV-space area (real-avatar
+# finding: 758 bbox "overlaps" that were mostly non-overlapping concave
+# shapes packed edge-to-edge).
+#
+# Stage 2 (exact confirmation): for every stage-1 candidate pair, sample up
+# to 40 points from the smaller island (its faces' raw loop UV coordinates
+# plus each face's UV centroid) and test each point against the larger
+# island's fan-triangulated faces with a strict barycentric point-in-triangle
+# test (epsilon 1e-7, so touching-but-not-overlapping edges don't count).
+# Triangle lists and sample points are precomputed once per island (not per
+# pair) so the O(candidates x samples x triangles) stage-2 cost stays cheap
+# even at ~800 candidate pairs.
 
 
-def _uv_island_bboxes(me) -> list[tuple[float, float, float, float]]:
+_TRI_EPS = 1e-7
+_TRI_AREA_EPS = 1e-12
+_MAX_SAMPLE_POINTS = 40
+
+
+def _face_uv_triangles(
+    loop_uvs: list[tuple[float, float]],
+) -> list[tuple[tuple[float, float], tuple[float, float], tuple[float, float]]]:
+    """Fan-triangulate a face's loop UVs from loop 0 (works for tri/quad/ngon).
+
+    Degenerate (near-zero-area) triangles are dropped so they can never
+    register a spurious "inside" hit.
+    """
+    triangles = []
+    if len(loop_uvs) < 3:
+        return triangles
+    p0 = loop_uvs[0]
+    for k in range(1, len(loop_uvs) - 1):
+        tri = (p0, loop_uvs[k], loop_uvs[k + 1])
+        (ax, ay), (bx, by), (cx, cy) = tri
+        area2 = abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay))
+        if area2 > _TRI_AREA_EPS:
+            triangles.append(tri)
+    return triangles
+
+
+def _point_in_triangle_strict(
+    p: tuple[float, float],
+    tri: tuple[tuple[float, float], tuple[float, float], tuple[float, float]],
+) -> bool:
+    """Strict (open) barycentric point-in-triangle test, epsilon 1e-7."""
+    (ax, ay), (bx, by), (cx, cy) = tri
+    px, py = p
+    denom = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+    if abs(denom) < _TRI_EPS:
+        return False  # degenerate triangle -- never a hit
+    a = ((by - cy) * (px - cx) + (cx - bx) * (py - cy)) / denom
+    b = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) / denom
+    c = 1.0 - a - b
+    return a > _TRI_EPS and b > _TRI_EPS and c > _TRI_EPS
+
+
+def _uv_island_data(me) -> list[dict]:
+    """Per-island UV data used by the two-stage overlap test: bbox, a
+    precomputed fan-triangulation of every member face, and up to
+    `_MAX_SAMPLE_POINTS` sample points (raw loop UVs + face centroids,
+    evenly strided down if there are more than the cap).
+    """
     bm = bmesh.new()
     bm.from_mesh(me)
     try:
@@ -400,18 +501,42 @@ def _uv_island_bboxes(me) -> list[tuple[float, float, float, float]]:
                     ds.union(f1, f2)
 
         groups = ds.groups()
-        bboxes: list[tuple[float, float, float, float]] = []
+        islands: list[dict] = []
         for members in groups.values():
             xs: list[float] = []
             ys: list[float] = []
+            triangles: list[
+                tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
+            ] = []
+            points: list[tuple[float, float]] = []
             for fi in members:
-                for l in bm.faces[fi].loops:
-                    uv = l[uvl].uv
-                    xs.append(uv.x)
-                    ys.append(uv.y)
-            if xs:
-                bboxes.append((min(xs), min(ys), max(xs), max(ys)))
-        return bboxes
+                loop_uvs = [(l[uvl].uv.x, l[uvl].uv.y) for l in bm.faces[fi].loops]
+                if not loop_uvs:
+                    continue
+                for x, y in loop_uvs:
+                    xs.append(x)
+                    ys.append(y)
+                    points.append((x, y))
+                points.append(
+                    (
+                        sum(x for x, _ in loop_uvs) / len(loop_uvs),
+                        sum(y for _, y in loop_uvs) / len(loop_uvs),
+                    )
+                )
+                triangles.extend(_face_uv_triangles(loop_uvs))
+            if not xs:
+                continue
+            if len(points) > _MAX_SAMPLE_POINTS:
+                stride = len(points) / float(_MAX_SAMPLE_POINTS)
+                points = [points[int(i * stride)] for i in range(_MAX_SAMPLE_POINTS)]
+            islands.append(
+                {
+                    "bbox": (min(xs), min(ys), max(xs), max(ys)),
+                    "triangles": triangles,
+                    "points": points,
+                }
+            )
+        return islands
     finally:
         bm.free()
 
@@ -422,11 +547,37 @@ def _bbox_overlap(a: tuple[float, float, float, float], b: tuple[float, float, f
     return ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1
 
 
-def _count_bbox_overlaps(bboxes: list[tuple[float, float, float, float]]) -> int:
-    n = len(bboxes)
+def _islands_overlap_exact(island_a: dict, island_b: dict) -> bool:
+    """Point-in-triangle confirmation for one stage-1 bbox-candidate pair.
+
+    Samples the smaller island's precomputed points against the larger
+    island's precomputed triangles (both directions would be redundant --
+    if any point of either island lies inside the other, the pair overlaps,
+    so sampling the smaller side is sufficient and cheaper).
+    """
+    if len(island_a["points"]) <= len(island_b["points"]):
+        small, large = island_a, island_b
+    else:
+        small, large = island_b, island_a
+    if not small["points"] or not large["triangles"]:
+        return False
+    for p in small["points"]:
+        for tri in large["triangles"]:
+            if _point_in_triangle_strict(p, tri):
+                return True
+    return False
+
+
+def _count_island_overlaps(islands: list[dict]) -> tuple[int, int]:
+    """Return (confirmed_overlap_count, stage1_candidate_pair_count)."""
+    n = len(islands)
+    candidates = 0
     count = 0
     for i in range(n):
         for j in range(i + 1, n):
-            if _bbox_overlap(bboxes[i], bboxes[j]):
+            if not _bbox_overlap(islands[i]["bbox"], islands[j]["bbox"]):
+                continue
+            candidates += 1
+            if _islands_overlap_exact(islands[i], islands[j]):
                 count += 1
-    return count
+    return count, candidates
