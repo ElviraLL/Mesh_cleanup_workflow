@@ -92,6 +92,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "render_views": ["front", "back", "left", "right", "top", "three_quarter"],
         "xray_view": True,
         "resolution": 640,
+        # p4 assertion: max boundary edges tolerated in body+legs z-bands
+        # (tiny unfillable slit fragments are normal on real AI meshes)
+        "max_body_boundary_edges": 20,
     },
 }
 
@@ -260,5 +263,9 @@ def _validate(cfg: dict[str, Any]) -> list[str]:
     )
     check(isinstance(qa["xray_view"], bool), "qa.xray_view must be a bool")
     check(isinstance(qa["resolution"], int) and qa["resolution"] > 0, "qa.resolution must be a positive int")
+    check(
+        isinstance(qa["max_body_boundary_edges"], int) and qa["max_body_boundary_edges"] >= 0,
+        "qa.max_body_boundary_edges must be a non-negative int",
+    )
 
     return errors

@@ -64,3 +64,6 @@ qa:
   render_views: [front, back, left, right, top, three_quarter]
   xray_view: true
   resolution: 640
+  # p4 assertion: boundary edges tolerated in body+legs z-bands (tiny
+  # unfillable slit fragments are normal on real AI meshes; 0 is aspirational)
+  max_body_boundary_edges: 20

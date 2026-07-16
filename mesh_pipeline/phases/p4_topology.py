@@ -45,6 +45,7 @@ DESTRUCTIVE = True
 _WELD_DIST = 2e-5
 _MAX_FLAP_ITERS = 30
 _MAX_FIN_ITERS = 30
+_FILL_MAX_ROUNDS = 5  # fill rounds expose new fillable loops (docs); bounded
 _DESPIKE_DIHEDRAL_DEG = 120.0
 _DESPIKE_LERP = 0.3
 _DESPIKE_PASSES = 2
@@ -102,31 +103,66 @@ def run(ctx: PipelineContext, cfg: dict) -> PhaseResult:
             "before p5_mouth runs; zone not enforced this phase (fallback per docs)"
         )
 
-    loops = _boundary_loops(bm)
-    filled_faces: list = []
+    # Iterative fill, per docs ("run another fill pass after each deletion
+    # round; boundary count can *rise* mid-cleanup and that's fine"):
+    # holes_fill defeats cleanly-cycled holes only -- on real AI meshes the
+    # slits left by inner-layer deletion routinely make it return nothing
+    # (verified on avatar_003: holes_fill filled 0/23 remaining loops while
+    # triangle_fill rescued 16/23). So per loop: holes_fill first, then
+    # triangle_fill as fallback; iterate rounds until no progress.
     holes_filled = 0
     skipped_protected = 0
-    for loop_edges in loops:
-        size = len(loop_edges)
-        if size == 0 or size > max_loop_edges:
-            continue
-        median = _loop_median_world(loop_edges, body_obj.matrix_world)
-        if _in_protected_zone(median, eye_zones):
-            skipped_protected += 1
-            continue
-        result = bmesh.ops.holes_fill(bm, edges=loop_edges, sides=0)
-        new_faces = result.get("faces", [])
-        filled_faces.extend(new_faces)
-        if new_faces:
-            holes_filled += 1
+    unfilled_loops = 0
+    for fill_round in range(_FILL_MAX_ROUNDS):
+        progress = 0
+        unfilled_loops = 0
+        filled_faces: list = []
+        for loop_edges in _boundary_loops(bm):
+            loop_edges = [e for e in loop_edges if e.is_valid]
+            size = len(loop_edges)
+            if size == 0 or size > max_loop_edges:
+                continue
+            median = _loop_median_world(loop_edges, body_obj.matrix_world)
+            if _in_protected_zone(median, eye_zones):
+                skipped_protected += 1
+                continue
+            result = bmesh.ops.holes_fill(bm, edges=loop_edges, sides=0)
+            new_faces = [f for f in result.get("faces", []) if f.is_valid]
+            if not new_faces:
+                live = [e for e in loop_edges if e.is_valid]
+                if live:
+                    tri = bmesh.ops.triangle_fill(bm, edges=live, use_beauty=True)
+                    new_faces = [
+                        g for g in tri.get("geom", [])
+                        if isinstance(g, bmesh.types.BMFace) and g.is_valid
+                    ]
+            filled_faces.extend(new_faces)
+            if new_faces:
+                holes_filled += 1
+                progress += 1
+            else:
+                unfilled_loops += 1
+
+        # triangulate this round's n-gon fills before the next loop scan
+        ngon_fills = [f for f in filled_faces if f.is_valid and len(f.verts) > 3]
+        if ngon_fills:
+            bmesh.ops.triangulate(bm, faces=ngon_fills, quad_method="BEAUTY", ngon_method="BEAUTY")
+        if not progress:
+            break
+        # gentle stitch between rounds (docs: dissolve_degenerate + gentle
+        # remove_doubles(2e-5) between passes helps)
+        bmesh.ops.dissolve_degenerate(bm, dist=1e-7, edges=bm.edges[:])
+        bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=2e-5)
 
     if skipped_protected:
         notes.append(f"hole fill: skipped {skipped_protected} loop(s) inside protected zones")
+    if unfilled_loops:
+        notes.append(
+            f"hole fill: {unfilled_loops} small loop(s) could not be filled by "
+            "holes_fill or triangle_fill (left open)"
+        )
 
-    # -- 6. triangulate fill n-gons, recalc_face_normals -------------------------
-    ngon_fills = [f for f in filled_faces if f.is_valid and len(f.verts) > 3]
-    if ngon_fills:
-        bmesh.ops.triangulate(bm, faces=ngon_fills, quad_method="BEAUTY", ngon_method="BEAUTY")
+    # -- 6. recalc normals after all fills ---------------------------------------
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
 
     # -- 7. targeted despike -------------------------------------------------------
